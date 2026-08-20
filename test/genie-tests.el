@@ -180,6 +180,23 @@
         (should-not (car verdict))
         (should (string-match-p "bad\\.el" (cdr verdict)))))))
 
+;;;; genie: maintainer charter
+
+(ert-deftest genie-charter-covers-maintainer-duties ()
+  "The system prompt carries the anti-slop charter, not just edit permissions."
+  (genie-tests--with-repo
+    (let ((prompt (genie--context-prompt)))
+      (dolist (duty '("thin bootstrap" "one-responsibility"
+                      "web search" "Never hand-roll"
+                      "docstring" "Refactor as you go"))
+        (should (string-match-p duty prompt)))
+      (should (string-match-p (regexp-quote genie-manual-file) prompt)))))
+
+(ert-deftest genie-manual-requires-existing-file ()
+  "`genie-manual' refuses politely when no manual has grown yet."
+  (genie-tests--with-repo
+    (should-error (genie-manual) :type 'user-error)))
+
 ;;;; genie: spells
 
 (ert-deftest genie-extract-elisp ()

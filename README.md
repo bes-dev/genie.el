@@ -69,6 +69,26 @@ You also need one of the agent backends on `PATH`:
   via a shared `--session` file. Select with `(setq genie-backend 'elmee)`,
   pass a model via `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`.
 
+## A maintainer, not a generator
+
+The agent operates under a *maintainer charter* (the system prompt), built to
+keep a config coherent over hundreds of wishes — including a config grown from
+an empty `init.el` with nothing but genie in it:
+
+- **Architecture** — `init.el` stays a thin bootstrap; features live in
+  one-responsibility modules; the structure is established on the first wish
+  and refactored as it grows (extend and simplify instead of adding parallel
+  copies; delete what a change obsoletes).
+- **Research first** — for any non-trivial wish the agent checks how the
+  ecosystem already solves it (built-in feature? established package?) using
+  its web tools, and never hand-rolls what a maintained package does better.
+  The report names what was considered and why.
+- **Documentation** — every definition gets a real docstring, and the agent
+  maintains `GENIE.md`: the config's user manual, updated with each
+  user-facing change. After apply, genie shows the agent's report — what
+  changed and exactly how to use it; `genie-manual` opens the accumulated
+  reference.
+
 ## Safety model
 
 - **Restore point per wish** — before the agent runs, the worktree is captured
@@ -98,6 +118,7 @@ You also need one of the agent backends on `PATH`:
 | `genie-spell` | `C-c g s` | Conjure an ephemeral command from a request |
 | `genie-cast` | `C-c g x` | Invoke it (`C-u` picks among session spells) |
 | `genie-spell-keep` | — | Make the current spell permanent |
+| `genie-manual` | `C-c g m` | Open the config's user manual, grown wish by wish |
 
 Wishes stated while a diff is pending refine it: the review stays cumulative
 against the same restore point.
@@ -110,6 +131,7 @@ against the same restore point.
 | `genie-config-root` | `user-emacs-directory` | The git repo genie may edit |
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
 | `genie-auto-apply` | `nil` | Skip review when validation passes |
+| `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
 | `genie-pi-program`, `genie-pi-args`, `genie-pi-model` | | Pi invocation |
 | `genie-elmee-program`, `genie-elmee-args` | | elmee invocation |
 

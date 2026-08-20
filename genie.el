@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -52,6 +52,7 @@
 ;;   (global-set-key (kbd "C-c g k") #'genie-abort)
 ;;   (global-set-key (kbd "C-c g s") #'genie-spell)
 ;;   (global-set-key (kbd "C-c g x") #'genie-cast)
+;;   (global-set-key (kbd "C-c g m") #'genie-manual)
 
 ;;; Code:
 
@@ -105,6 +106,12 @@ Must be a git repository."
 (defcustom genie-auto-apply nil
   "When non-nil, commit and reload without the diff review if validation passes."
   :type 'boolean :group 'genie)
+
+(defcustom genie-manual-file "GENIE.md"
+  "The config's user manual, relative to `genie-config-root'.
+The agent keeps it updated as the config grows: a concise reference of
+the features and keybindings each wish added.  Open it with `genie-manual'."
+  :type 'string :group 'genie)
 
 (defconst genie-buffer "*genie*"
   "Name of the transcript/chat buffer.")
@@ -174,24 +181,54 @@ Must be a git repository."
 ;;;; The agent session
 
 (defun genie--context-prompt ()
-  "Return the system-prompt addendum describing the config and house rules."
+  "Return the system-prompt addendum: the maintainer charter for the agent."
   (let ((root (genie--root)))
     (format "You are the resident genie of the Emacs configuration at `%s`, \
 currently running live in Emacs %s. The user states wishes in natural \
-language; fulfill them by editing the config files with your edit tools.
+language; fulfill them by editing the config files with your edit tools. \
+You are not a code generator — you are this configuration's long-term \
+maintainer, and every wish must leave it better engineered than you found it.
 
-Rules:
-- Edit ONLY files under that root, using ABSOLUTE paths; never cd; never \
-touch `.git/`.
-- Minimal idiomatic Elisp matching the existing style; lexical-binding; no \
-dead code.
+Architecture:
+- `init.el' is a thin bootstrap: package-manager setup and module wiring \
+only. Feature code lives in one-responsibility module files — in the \
+config's existing module directory if it has one, otherwise create \
+`modules/' and wire it from `init.el'.
+- Starting from an empty or single-package config is normal: establish \
+this structure with the first wish and grow it incrementally.
+- Prefer, in order: built-in Emacs features; established, maintained \
+packages (installed through the config's package manager, wired with \
+`use-package'); custom code last, and only as much as the wish needs.
+- Refactor as you go: when a wish overlaps existing code, extend or \
+simplify it instead of adding a parallel copy; delete code your change \
+obsoletes. No dead code, no duplication, minimal diffs, style matching \
+the surrounding file, lexical-binding everywhere.
+
+Research:
+- For any wish that is not trivially obvious, first check how the Emacs \
+ecosystem already solves it — a built-in feature, a well-known package, an \
+established idiom — using your web search/fetch tools when available. \
+Never hand-roll what a maintained package does better. Name in the report \
+what you considered and why you chose what you chose.
+
+Documentation:
+- Every defun, defvar and defcustom you write gets a proper docstring: \
+first line a complete sentence, arguments documented.
+- Maintain `%s' (relative to the config root) as the config's user \
+manual: a concise, well-organized reference of the features and \
+keybindings this config provides. Update the relevant section with every \
+wish that adds or changes something user-facing; create the file on first \
+need.
+- Finish every wish with a short report in the user's language: what \
+changed, how to use it (exact keys and commands), what you researched and \
+rejected, and whether a full Emacs restart is needed.
+
+Hard rules:
+- Edit ONLY files under the config root, using ABSOLUTE paths; never cd; \
+never touch `.git/'.
 - Do NOT run git and do NOT reload or restart Emacs — the Emacs side \
-validates, commits and hot-reloads your edits itself.
-- Keep the config's own documentation in sync when your edit adds or \
-changes a module or keybinding.
-- Finish with a short report (in the user's language) of what changed and \
-whether a full Emacs restart is needed."
-            root emacs-version)))
+validates, commits and hot-reloads your edits itself."
+            root emacs-version genie-manual-file)))
 
 (defun genie--elmee-session-file ()
   "Return (creating the name lazily) the shared elmee session file."
@@ -518,7 +555,9 @@ The config must still boot cleanly with the pending edits in place."
     (genie--reset)
     (genie--quit-diff)
     (message "🧞 wish applied and committed")
-    (genie--reload files)))
+    (genie--reload files)
+    ;; The agent's report documents what was added and how to use it.
+    (display-buffer (genie--buffer))))
 
 (defun genie-reject ()
   "Discard the pending wish: restore every touched file to its pre-wish state."
@@ -643,6 +682,15 @@ it:\n\n```elisp\n%s\n```" code))))
   (when genie--busy (user-error "Genie is busy (M-x genie-abort interrupts)"))
   (when (string-empty-p wish) (user-error "Empty wish"))
   (genie--submit wish))
+
+;;;###autoload
+(defun genie-manual ()
+  "Open the config's user manual, grown by the agent wish by wish."
+  (interactive)
+  (let ((file (expand-file-name genie-manual-file (genie--root))))
+    (unless (file-exists-p file)
+      (user-error "Genie: no manual yet — it grows as you make wishes"))
+    (find-file file)))
 
 ;;;###autoload
 (defun genie-chat ()
