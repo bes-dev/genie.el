@@ -36,6 +36,12 @@ straight into the running session (nothing touches disk) and arms it on
 `M-x genie-cast`. Liked it? `M-x genie-spell-keep` turns it into a permanent
 wish through the same review pipeline.
 
+Spells live in **registers**, in the spirit of Emacs's `C-x r`: when
+conjuring, you pick a digit (or `RET` to skip) and the spell lands on
+`C-c g <digit>` — ten programmable keys whose meaning you rewrite in natural
+language as the day demands. `C-c g x` always casts the most recent spell;
+`C-u C-c g x` lists every spell of the session with its register.
+
 The UI never blocks: the agent runs as an async subprocess, tokens and tool
 activity stream live into the `*genie*` transcript (which doubles as a
 multi-turn chat via `M-x genie-chat`).
@@ -54,7 +60,10 @@ Not on MELPA yet. With `straight.el`:
          ("C-c g u" . genie-undo)
          ("C-c g k" . genie-abort)
          ("C-c g s" . genie-spell)
-         ("C-c g x" . genie-cast)))
+         ("C-c g x" . genie-cast)
+         ("C-c g m" . genie-manual))
+  :init (dotimes (i 10)                 ; ten programmable spell registers
+          (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register)))
 ```
 
 Or clone and `(add-to-list 'load-path "…/genie.el") (require 'genie)`.
@@ -116,7 +125,9 @@ an empty `init.el` with nothing but genie in it:
 | `genie-undo` | `C-c g u` | Revert the last applied wish and reload |
 | `genie-abort` | `C-c g k` | Abort the turn in flight |
 | `genie-spell` | `C-c g s` | Conjure an ephemeral command from a request |
-| `genie-cast` | `C-c g x` | Invoke it (`C-u` picks among session spells) |
+| `genie-cast` | `C-c g x` | Invoke the current spell (`C-u` picks among all) |
+| `genie-cast-register` | `C-c g 1`…`0` | Cast the spell stored in that register |
+| `genie-spell-bind` | — | Put a conjured spell into a register |
 | `genie-spell-keep` | — | Make the current spell permanent |
 | `genie-manual` | `C-c g m` | Open the config's user manual, grown wish by wish |
 

@@ -244,5 +244,22 @@
     (genie--learn-spell "```elisp\n(setq genie-tests--var 1)\n```")
     (should (eq genie--spell 'genie-spell/number-lines))))
 
+(ert-deftest genie-spell-registers ()
+  "Registers store spells by digit; casting an empty register errors clearly."
+  (let ((genie--registers nil)
+        (genie--spells nil)
+        (genie--spell nil)
+        (genie--pending-register ?3))
+    ;; conjuring with a pending register lands the spell there
+    (genie--learn-spell
+     "(defun genie-spell/test-reg () (interactive) 'cast)")
+    (should (eq (alist-get ?3 genie--registers) 'genie-spell/test-reg))
+    (should-not genie--pending-register)
+    (should (eq (genie-cast-register ?3) 'cast))
+    (should-error (genie-cast-register ?7) :type 'user-error)
+    ;; rebinding a register evicts the old spell in place
+    (genie--bind-register ?3 'ignore)
+    (should (eq (alist-get ?3 genie--registers) 'ignore))))
+
 (provide 'genie-tests)
 ;;; genie-tests.el ends here

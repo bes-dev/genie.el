@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.3.0] — 2026-08-20
+
+Spell registers, in the spirit of `C-x r`.
+
+- `genie-spell` now asks for a register digit (RET skips): the conjured
+  command lands both as the current spell and in that register.
+- New: `genie-cast-register` — bind it to `C-c g 1`..`C-c g 0` for ten
+  programmable keys whose meaning is rewritten in natural language;
+  `genie-spell-bind` slots any session spell into a register later.
+- `C-u genie-cast` now annotates each spell with its register.
+
 ## [0.2.0] — 2026-08-20
 
 The maintainer charter: genie is a config maintainer, not a code generator.

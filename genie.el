@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -53,6 +53,8 @@
 ;;   (global-set-key (kbd "C-c g s") #'genie-spell)
 ;;   (global-set-key (kbd "C-c g x") #'genie-cast)
 ;;   (global-set-key (kbd "C-c g m") #'genie-manual)
+;;   (dotimes (i 10)                       ; ten programmable spell registers
+;;     (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))
 
 ;;; Code:
 
@@ -137,6 +139,8 @@ the features and keybindings each wish added.  Open it with `genie-manual'."
 (defvar genie--answer "" "Accumulated answer text of the turn in flight.")
 (defvar genie--spell nil "Symbol of the current conjured command.")
 (defvar genie--spells nil "Alist of (COMMAND . CODE) conjured this session, newest first.")
+(defvar genie--registers nil "Alist of (DIGIT-CHAR . COMMAND) spell registers.")
+(defvar genie--pending-register nil "Register chosen for the spell being conjured.")
 
 ;;;; Git plumbing
 
@@ -616,6 +620,19 @@ The config must still boot cleanly with the pending edits in place."
     (unless fn (error "The reply defines no interactive command"))
     fn))
 
+(defun genie--read-register (prompt &optional allow-skip)
+  "Read a spell register digit with PROMPT; RET skips when ALLOW-SKIP."
+  (let ((char (read-char prompt)))
+    (cond ((and allow-skip (memq char '(?\r ?\n))) nil)
+          ((<= ?0 char ?9) char)
+          (t (user-error "Genie: a register is a digit 0-9")))))
+
+(defun genie--bind-register (digit fn)
+  "Store spell command FN in register DIGIT (a character), reporting evictions."
+  (when-let* ((old (alist-get digit genie--registers)))
+    (unless (eq old fn) (message "🧞 register %c: %s evicted" digit old)))
+  (setf (alist-get digit genie--registers) fn))
+
 (defun genie--learn-spell (answer)
   "Extract the conjured command from ANSWER, eval it and make it current."
   (condition-case err
@@ -623,21 +640,29 @@ The config must still boot cleanly with the pending edits in place."
              (fn (genie--eval-spell code)))
         (push (cons fn code) genie--spells)
         (setq genie--spell fn)
-        (message "🧞 spell armed: %s — cast with M-x genie-cast" fn))
+        (when genie--pending-register
+          (genie--bind-register genie--pending-register fn))
+        (message "🧞 spell armed: %s — cast with M-x genie-cast%s" fn
+                 (if genie--pending-register
+                     (format " or register %c" genie--pending-register)
+                   "")))
     (error (display-buffer (genie--buffer))
-           (message "🧞 spell failed: %s" (error-message-string err)))))
+           (message "🧞 spell failed: %s" (error-message-string err))))
+  (setq genie--pending-register nil))
 
 ;;;###autoload
-(defun genie-spell (request)
+(defun genie-spell (request &optional register)
   "Conjure an ephemeral interactive command implementing REQUEST.
 The generated function is evaluated into the running session (no files
-are touched) and armed on `genie-cast'.  `genie-spell-keep' makes it
-permanent."
-  (interactive (list (string-trim
-                      (read-string "🧞 Spell (command to conjure): "))))
+are touched) and armed on `genie-cast'; with REGISTER (a digit
+character) it also lands in that spell register, castable via
+`genie-cast-register'.  `genie-spell-keep' makes a spell permanent."
+  (interactive
+   (list (string-trim (read-string "🧞 Spell (command to conjure): "))
+         (genie--read-register "🧞 Register for it (0-9, RET to skip): " t)))
   (when genie--busy (user-error "Genie is busy (M-x genie-abort interrupts)"))
   (when (string-empty-p request) (user-error "Empty spell"))
-  (setq genie--turn 'spell)
+  (setq genie--turn 'spell genie--pending-register register)
   (genie--submit
    (format "SPELL MODE — do NOT edit, create or run anything; this is pure \
 code generation. Reply with ONLY one Emacs Lisp code block containing a \
@@ -654,14 +679,47 @@ reading, docstring in the user's language, name it \
   (interactive "P")
   (when pick
     (unless genie--spells (user-error "Genie: no spells conjured yet"))
-    (setq genie--spell (intern (completing-read
-                                "Cast: "
-                                (mapcar (lambda (s) (symbol-name (car s)))
-                                        genie--spells)
-                                nil t))))
+    (let* ((cands (mapcar (lambda (spell)
+                            (let* ((fn (car spell))
+                                   (reg (car (rassq fn genie--registers))))
+                              (cons (if reg (format "%s  [%c]" fn reg)
+                                      (symbol-name fn))
+                                    fn)))
+                          genie--spells))
+           (choice (completing-read "Cast: " (mapcar #'car cands) nil t)))
+      (setq genie--spell (cdr (assoc choice cands)))))
   (unless (commandp genie--spell)
     (user-error "Genie: no spell armed — conjure one with M-x genie-spell"))
   (call-interactively genie--spell))
+
+;;;###autoload
+(defun genie-cast-register (&optional digit)
+  "Cast the spell stored in register DIGIT.
+Interactively the register is the digit key that invoked the command, so
+binding this to \\`C-c g 1' .. \\`C-c g 0' gives ten programmable keys."
+  (interactive)
+  (let* ((digit (or digit last-command-event))
+         (fn (alist-get digit genie--registers)))
+    (unless (characterp digit)
+      (user-error "Genie: bind this command to keys ending in a digit"))
+    (unless fn
+      (user-error "Genie: register %c is empty — fill it with M-x genie-spell"
+                  digit))
+    (call-interactively fn)))
+
+;;;###autoload
+(defun genie-spell-bind ()
+  "Put one of this session's spells (default the current one) into a register."
+  (interactive)
+  (unless genie--spells (user-error "Genie: no spells conjured yet"))
+  (let* ((names (mapcar (lambda (s) (symbol-name (car s))) genie--spells))
+         (default (and genie--spell (symbol-name genie--spell)))
+         (name (completing-read
+                (format-prompt "Spell to bind" default) names nil t nil nil
+                default))
+         (digit (genie--read-register "🧞 Register (0-9): ")))
+    (genie--bind-register digit (intern name))
+    (message "🧞 register %c ← %s" digit name)))
 
 ;;;###autoload
 (defun genie-spell-keep ()
