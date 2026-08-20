@@ -78,6 +78,54 @@ You also need one of the agent backends on `PATH`:
   via a shared `--session` file. Select with `(setq genie-backend 'elmee)`,
   pass a model via `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`.
 
+## Starting from nothing
+
+The title is a claim, and here is the experiment: a config that contains genie
+and nothing else. Everything it will ever have arrives as a wish.
+
+```elisp
+;;; init.el --- All you need -*- lexical-binding: t; -*-
+
+(require 'package)
+(unless (bound-and-true-p package--initialized) (package-initialize))
+
+;; The genie itself, straight from the repository (Emacs 29+).
+(unless (package-installed-p 'genie)
+  (package-vc-install "https://github.com/bes-dev/genie.el"))
+(require 'genie)
+
+;; The lamp's controls.
+(global-set-key (kbd "C-c g g") #'genie)         ; state a wish
+(global-set-key (kbd "C-c g c") #'genie-chat)    ; multi-turn chat
+(global-set-key (kbd "C-c g d") #'genie-diff)    ; review the pending diff
+(global-set-key (kbd "C-c g u") #'genie-undo)    ; revert the last wish
+(global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
+(global-set-key (kbd "C-c g s") #'genie-spell)   ; conjure an ephemeral command
+(global-set-key (kbd "C-c g x") #'genie-cast)    ; cast the current spell
+(global-set-key (kbd "C-c g m") #'genie-manual)  ; the manual, grown wish by wish
+(dotimes (i 10)                                  ; ten programmable spell registers
+  (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))
+```
+
+[`bootstrap.sh`](bootstrap.sh) sets this up for you — it writes the init.el
+above into `~/.emacs.d` (refusing to touch an existing config) and makes the
+directory a git repository, which the wish pipeline requires:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bes-dev/genie.el/main/bootstrap.sh | bash
+```
+
+To try the empty lamp without risking anything, point it elsewhere:
+
+```sh
+EMACS_D=/tmp/lamp ./bootstrap.sh && emacs --init-directory /tmp/lamp
+```
+
+Then launch Emacs (the first start installs genie from GitHub), rub the lamp
+with `C-c g g` — and don't waste wishes on trifles. On Emacs 28, where
+`package-vc-install` is missing, clone the repo and use `load-path` as in
+[Install](#install).
+
 ## A maintainer, not a generator
 
 The agent operates under a *maintainer charter* (the system prompt), built to

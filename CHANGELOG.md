@@ -13,6 +13,10 @@ Spell registers, in the spirit of `C-x r`.
   programmable keys whose meaning is rewritten in natural language;
   `genie-spell-bind` slots any session spell into a register later.
 - `C-u genie-cast` now annotates each spell with its register.
+- New: `bootstrap.sh` and a README recipe for the empty-lamp start — an
+  `~/.emacs.d` containing genie and nothing else, git-initialized, with
+  genie installed from the repository via `package-vc-install` on first
+  launch (Emacs 29+).
 
 ## [0.2.0] — 2026-08-20
 
