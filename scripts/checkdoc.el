@@ -4,6 +4,7 @@
 ;; and exits non-zero when any warning was emitted.
 ;;; Code:
 (require 'checkdoc)
+(require 'subr-x)                       ; when-let* on Emacs 28
 (let ((sentence-end-double-space t))
   (dolist (file command-line-args-left)
     (checkdoc-file file)))
