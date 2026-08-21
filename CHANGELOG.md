@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.7.0] — 2026-08-22
+
+- The mode-line activity indicator now spins: an animated braille
+  spinner runs in every mode line while the agent thinks or the config
+  validates (`🧞⠹ thinking…`, `🧞⠹ apply_patch init.el…`,
+  `🧞⠹ validating…`), driven by a timer that exists only while genie
+  works. Long ACP tool titles are truncated to keep the line tidy.
+
 ## [0.6.1] — 2026-08-21
 
 Field fixes for the unified undo, from a first day of real use.

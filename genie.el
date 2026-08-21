@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.6.1
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -189,17 +189,54 @@ where PRE and POST are its `buffer-undo-list' before and after.")
 
 ;;;; The state machine
 
+(defconst genie--spinner-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Frames of the activity spinner.")
+(defvar genie--spinner-index 0 "Current frame of the activity spinner.")
+(defvar genie--spinner-timer nil "Timer animating the spinner while genie works.")
+
+(defun genie--activity (&optional verbose)
+  "Return the spinning activity string for mode lines, or nil when quiet.
+With VERBOSE, thinking also names the abort key of the chat buffer."
+  (let ((spin (aref genie--spinner-frames
+                    (mod genie--spinner-index
+                         (length genie--spinner-frames)))))
+    (pcase genie--state
+      ('thinking
+       (format "🧞%s %s" spin
+               (cond (genie--tool (concat (truncate-string-to-width
+                                           genie--tool 40 nil nil "…")
+                                          "…"))
+                     (verbose "thinking… (C-c C-k abort)")
+                     (t "thinking…"))))
+      ('validating (format "🧞%s validating…" spin))
+      (_ nil))))
+
 (defvar genie--mode-line
-  '(:eval (pcase genie--state
-            ('thinking (if genie--tool (format " 🧞%s…" genie--tool) " 🧞…"))
-            ('validating " 🧞validating…")
-            (_ "")))
+  '(:eval (let ((activity (genie--activity)))
+            (if activity (concat " " activity) "")))
   "Mode-line construct showing genie activity in every buffer.")
 (put 'genie--mode-line 'risky-local-variable t)
 
+(defun genie--spinner-tick ()
+  "Advance the activity spinner and repaint, stopping when genie is quiet."
+  (if (memq genie--state '(thinking validating))
+      (progn (setq genie--spinner-index (1+ genie--spinner-index))
+             (force-mode-line-update t))
+    (when genie--spinner-timer
+      (cancel-timer genie--spinner-timer)
+      (setq genie--spinner-timer nil))))
+
 (defun genie--set-state (state)
-  "Move the turn machine to STATE and refresh the mode lines."
+  "Move the turn machine to STATE, drive the spinner, refresh mode lines."
   (setq genie--state state)
+  (cond ((memq state '(thinking validating))
+         (unless genie--spinner-timer
+           (setq genie--spinner-index 0
+                 genie--spinner-timer
+                 (run-at-time 0 0.12 #'genie--spinner-tick))))
+        (genie--spinner-timer
+         (cancel-timer genie--spinner-timer)
+         (setq genie--spinner-timer nil)))
   (force-mode-line-update t))
 
 (defun genie--require-ready ()
@@ -404,11 +441,8 @@ Killing this buffer only discards the transcript view — the agent
 session lives on; `genie-quit' ends it."
   (setq-local mode-line-format
               '(" " (:propertize "%b" face mode-line-buffer-id)
-                (:eval (pcase genie--state
-                         ('thinking (if genie--tool (format "  ⏳ %s" genie--tool)
-                                      "  🧞 thinking… (C-c C-k abort)"))
-                         ('validating "  🧞 validating…")
-                         (_ "")))))
+                (:eval (let ((activity (genie--activity t)))
+                         (if activity (concat "  " activity) "")))))
   (visual-line-mode 1))
 
 (defun genie--insert-prompt ()

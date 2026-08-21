@@ -258,6 +258,24 @@
     (should-error (genie-reject) :type 'user-error)
     (should-error (genie-undo) :type 'user-error)))
 
+(ert-deftest genie-spinner-follows-state ()
+  "The spinner timer runs while genie works and stops when it is quiet."
+  (let ((genie--state 'idle) (genie--spinner-timer nil)
+        (genie--spinner-index 0) (genie--tool nil))
+    (unwind-protect
+        (progn
+          (genie--set-state 'thinking)
+          (should (timerp genie--spinner-timer))
+          (should (string-match-p "thinking…" (genie--activity)))
+          (genie--set-state 'validating)
+          (should (timerp genie--spinner-timer))
+          (should (string-match-p "validating…" (genie--activity)))
+          (genie--set-state 'idle)
+          (should-not genie--spinner-timer)
+          (should-not (genie--activity)))
+      (when (timerp genie--spinner-timer)
+        (cancel-timer genie--spinner-timer)))))
+
 (ert-deftest genie-finish-turn-ignores-late-events ()
   "A finish outside the thinking state must not re-run the pipeline."
   (let ((genie--state 'idle))
