@@ -221,6 +221,28 @@
     (should-not (file-exists-p (expand-file-name "d.el" (genie--root))))
     (should (equal (genie-tests--read "b.el") "(setq b 2)\n"))))
 
+(ert-deftest genie-reload-covers-init-el ()
+  "Reload evaluates changed modules first, then init.el itself."
+  (genie-tests--with-repo
+    (genie-tests--write "mod.el" "(setq genie-tests--mod-loaded t)\n")
+    (genie-tests--write
+     "init.el"
+     "(setq genie-tests--init-saw-mod (bound-and-true-p genie-tests--mod-loaded))\n")
+    (setq genie-tests--mod-loaded nil genie-tests--init-saw-mod nil)
+    (genie--reload '("mod.el" "init.el" "GENIE.md"))
+    (should (bound-and-true-p genie-tests--mod-loaded))
+    (should (bound-and-true-p genie-tests--init-saw-mod)))) ; init ran last
+
+(ert-deftest genie-reload-failure-offers-restart ()
+  "A file that fails to load falls back to the restart offer, not a crash."
+  (genie-tests--with-repo
+    (genie-tests--write "boom.el" "(error \"broken module\")\n")
+    (let (asked)
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (prompt) (setq asked prompt) nil)))
+        (genie--reload '("boom.el")))
+      (should (string-match-p "boom\\.el" asked)))))
+
 (ert-deftest genie-undo-refuses-foreign-head ()
   "Undo refuses when HEAD is not a genie commit."
   (genie-tests--with-repo

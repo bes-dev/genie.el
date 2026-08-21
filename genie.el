@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.7.2
+;; Version: 0.7.3
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -672,18 +672,30 @@ timeout rather than as a config failure."
     (quit-window nil window)))
 
 (defun genie--reload (files)
-  "Hot-reload changed Elisp FILES; offer a restart when init.el changed."
-  (let* ((els (cl-remove-if-not (lambda (f) (string-suffix-p ".el" f)) files))
-         (modules (cl-remove "init.el" els :test #'equal)))
-    (when modules
-      (message "🧞 reloading… (a first-time package install may take a while)"))
-    (dolist (file modules) (load (expand-file-name file (genie--root)) nil t))
-    (when modules
-      (message "🧞 reloaded: %s" (string-join modules " · ")))
-    (when (and (member "init.el" els)
-               (y-or-n-p "The init.el changed — restart Emacs to fully apply? "))
-      (if (fboundp 'restart-emacs) (restart-emacs)
-        (message "🧞 restart-emacs unavailable — please restart manually")))))
+  "Hot-reload changed Elisp FILES — init.el included, not just modules.
+Modules load first so init.el's wiring (use-package declarations,
+keybindings) picks up their fresh definitions; a file that fails to
+load falls back to offering a full restart."
+  (let* ((root (genie--root))
+         (els (cl-remove-if-not (lambda (f) (string-suffix-p ".el" f)) files))
+         (init (member "init.el" els))
+         (ordered (append (cl-remove "init.el" els :test #'equal)
+                          (and init '("init.el"))))
+         failed)
+    (when ordered
+      (message "🧞 reloading… (a first-time package install may take a while)")
+      (dolist (file ordered)
+        (condition-case err
+            (load (expand-file-name file root) nil t)
+          (error (push (format "%s: %s" file (error-message-string err))
+                       failed))))
+      (if failed
+          (when (y-or-n-p (format "Reload failed (%s) — restart Emacs? "
+                                  (string-join (nreverse failed) "; ")))
+            (if (fboundp 'restart-emacs) (restart-emacs)
+              (message "🧞 restart-emacs unavailable — please restart manually")))
+        (message "🧞 reloaded: %s%s" (string-join ordered " · ")
+                 (if init " — restart if anything misbehaves" ""))))))
 
 ;;;###autoload
 (defun genie-diff ()

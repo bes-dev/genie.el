@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.7.3] — 2026-08-22
+
+- Hot-reload now actually covers `init.el`: an applied wish reloads the
+  changed modules first and then init.el itself, so use-package wiring
+  and keybindings living there take effect immediately instead of only
+  after a restart. Every file loads under a condition-case; a failure
+  falls back to offering the restart, and a clean init reload notes
+  "restart if anything misbehaves".
+
 ## [0.7.2] — 2026-08-22
 
 - The activity indicator now heals itself: on every turn, genie
