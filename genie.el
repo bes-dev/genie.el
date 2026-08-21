@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.7.4
+;; Version: 0.8.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -196,18 +196,15 @@ where PRE and POST are its `buffer-undo-list' before and after.")
 
 (defun genie--activity (&optional verbose)
   "Return the spinning activity string for mode lines, or nil when quiet.
-With VERBOSE, thinking also names the abort key of the chat buffer."
+Deliberately terse — just the spinner and a word; the play-by-play of
+tool calls goes to the transcript buffer instead.  With VERBOSE,
+thinking also names the abort key of the chat buffer."
   (let ((spin (aref genie--spinner-frames
                     (mod genie--spinner-index
                          (length genie--spinner-frames)))))
     (pcase genie--state
-      ('thinking
-       (format "🧞%s %s" spin
-               (cond (genie--tool (concat (truncate-string-to-width
-                                           genie--tool 40 nil nil "…")
-                                          "…"))
-                     (verbose "thinking… (C-c C-k abort)")
-                     (t "thinking…"))))
+      ('thinking (format "🧞%s %s" spin
+                         (if verbose "thinking… (C-c C-k abort)" "thinking…")))
       ('validating (format "🧞%s validating…" spin))
       (_ nil))))
 
@@ -413,10 +410,15 @@ validates, commits and hot-reloads your edits itself."
         (genie--emit trimmed)))))
 
 (defun genie--on-tool (name)
-  "Show tool NAME as the current activity."
+  "Log tool NAME to the transcript; the mode line shows just the spinner.
+The play-by-play belongs in the `*genie*' log — not in the echo area,
+where it would clobber whatever the user is doing there."
   (setq genie--tool name)
-  (message "🧞 %s…" name)
-  (force-mode-line-update t))
+  (with-current-buffer (genie--buffer)
+    (unless (or (= (point-min) (point-max))
+                (eq (char-before (point-max)) ?\n))
+      (genie--emit "\n")))
+  (genie--emit (format "⏳ %s\n" name) 'shadow))
 
 (defun genie--on-done (answer)
   "End the turn; emit ANSWER when nothing was streamed."

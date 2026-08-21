@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.8.0] — 2026-08-22
+
+- Tool activity moved out of the echo area: each tool call is now a
+  quiet `⏳ name` line in the `*genie*` transcript, and the mode line
+  shows only the spinner with `thinking…` / `validating…`. The echo
+  area belongs to the user (and to cantrip output) again.
+
 ## [0.7.4] — 2026-08-22
 
 - A review lost to an Emacs restart no longer wedges the next wish:
