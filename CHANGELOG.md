@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.7.4] — 2026-08-22
+
+- A review lost to an Emacs restart no longer wedges the next wish:
+  the intent-to-add index entries genie marks on created files broke
+  `git stash create` ("Entry not uptodate. Cannot merge") forever after.
+  The snapshot now heals such leftovers first — the files stay in the
+  worktree as plain untracked files.
+
 ## [0.7.3] — 2026-08-22
 
 - Hot-reload now actually covers `init.el`: an applied wish reloads the

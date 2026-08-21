@@ -170,6 +170,19 @@
                    '("a.el" "b.el" "c.el")))
     (should (equal genie--created '("c.el")))))
 
+(ert-deftest genie-snapshot-heals-stale-intent-to-add ()
+  "A leftover `git add -N' entry (interrupted review) must not break stash.
+The healed file survives in the worktree as a plain untracked file."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (genie-tests--write "GENIE.md" "# leftover manual\n")
+    (genie--git "add" "-N" "--" "GENIE.md")   ; what a lost review leaves
+    (genie--snapshot)                          ; must not signal
+    (should (member "GENIE.md" genie--pre-untracked))
+    (should (equal (genie-tests--read "GENIE.md") "# leftover manual\n"))))
+
 (ert-deftest genie-git-reject-restores ()
   "Reject restores the pre-wish worktree but keeps the user's own WIP."
   (genie-tests--with-repo

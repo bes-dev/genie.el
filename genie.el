@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.7.3
+;; Version: 0.7.4
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -285,8 +285,24 @@ construct is what a frozen spinner looks like."
   "Return the list of untracked files in the config root."
   (split-string (genie--git "ls-files" "--others" "--exclude-standard") "\n" t))
 
+(defun genie--heal-index ()
+  "Drop stale intent-to-add index entries left by an interrupted cycle.
+`genie--detect-changes' marks created files with `git add -N'; a review
+lost to an Emacs restart leaves those entries behind, and `git stash
+create' cannot merge them (\"Entry not uptodate\").  The files stay in
+the worktree as plain untracked files."
+  ;; Intent-to-add entries are exactly the "new" files of the unstaged
+  ;; diff; genuinely staged additions live in the cached diff instead.
+  (let ((ita (split-string
+              (genie--git "diff" "--name-only" "--diff-filter=A") "\n" t)))
+    (when ita
+      (apply #'genie--git "restore" "--staged" "--" ita)
+      (message "🧞 cleared a stale review's leftovers: %s"
+               (string-join ita " · ")))))
+
 (defun genie--snapshot ()
   "Capture the pre-wish worktree: a restore point plus dirty baselines."
+  (genie--heal-index)
   (let ((stash (genie--git "stash" "create" "genie pre-wish")))
     (setq genie--pre (if (string-empty-p stash) "HEAD" stash)))
   (setq genie--pre-dirty (split-string (genie--git "diff" "--name-only" "HEAD")
