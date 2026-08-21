@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.7.0
+;; Version: 0.7.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -211,10 +211,15 @@ With VERBOSE, thinking also names the abort key of the chat buffer."
       ('validating (format "🧞%s validating…" spin))
       (_ nil))))
 
-(defvar genie--mode-line
-  '(:eval (let ((activity (genie--activity)))
-            (if activity (concat " " activity) "")))
-  "Mode-line construct showing genie activity in every buffer.")
+(defun genie--mode-line-string ()
+  "Return the global mode-line segment for genie activity."
+  (let ((activity (genie--activity)))
+    (if activity (concat " " activity) "")))
+
+(defvar genie--mode-line '(:eval (genie--mode-line-string))
+  "Mode-line construct showing genie activity in every buffer.
+A stable trampoline into `genie--mode-line-string': `defvar' keeps its
+old value across a reload, so this value must never need to change.")
 (put 'genie--mode-line 'risky-local-variable t)
 
 (defun genie--spinner-tick ()
@@ -977,13 +982,21 @@ reading, docstring in the user's language, name it \
             (progn (goto-char (cdr region))
                    (push-mark (car region) t t))
           (goto-char (plist-get target :point)))
-        (let ((before genie--journal))
+        (let ((before-journal genie--journal)
+              (before-message (current-message)))
           (genie--call-spell name (genie--spell-fn entry))
-          ;; Promise an undo only when there is an effect to undo — a
-          ;; cantrip that merely reported something leaves no journal entry.
-          (if (eq genie--journal before)
-              (message "🧞 %s" name)
-            (message "🧞 %s — M-x genie-undo reverts it" name)))))))
+          ;; The cantrip's own words own the echo area; genie only adds the
+          ;; undo hint when there is an effect to undo, and speaks for
+          ;; itself only when the cantrip said nothing.
+          (let ((journaled (not (eq genie--journal before-journal)))
+                (spoke (let ((now (current-message)))
+                         (and now (not (equal now before-message)) now))))
+            (cond
+             ((and spoke journaled)
+              (message "%s — 🧞 genie-undo reverts it" spoke))
+             (spoke)
+             (journaled (message "🧞 %s — M-x genie-undo reverts it" name))
+             (t (message "🧞 %s" name)))))))))
 
 ;;;###autoload
 (defun genie-cantrip (request)

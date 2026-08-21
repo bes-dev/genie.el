@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.7.1] — 2026-08-22
+
+- The global mode-line indicator is now a stable trampoline into a
+  function, so reloading genie in a running session actually updates it
+  (`defvar` keeps old values on reload — the 0.7.0 spinner looked static
+  to anyone who hot-reloaded instead of restarting).
+- A cantrip's own echo-area output is no longer clobbered by genie's
+  message: the cantrip's words stay on screen, with the undo hint
+  appended only when there is an effect to undo.
+
 ## [0.7.0] — 2026-08-22
 
 - The mode-line activity indicator now spins: an animated braille
