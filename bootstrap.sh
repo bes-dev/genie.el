@@ -52,6 +52,7 @@ cat > "$EMACS_D/init.el" <<'EOF'
 (global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
 (global-set-key (kbd "C-c g s") #'genie-spell)   ; conjure an ephemeral command
 (global-set-key (kbd "C-c g x") #'genie-cast)    ; cast the current spell
+(global-set-key (kbd "C-c g !") #'genie-cantrip) ; one-shot: conjure and run here
 (global-set-key (kbd "C-c g m") #'genie-manual)  ; the manual, grown wish by wish
 (dotimes (i 10)                                  ; ten programmable spell registers
   (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))

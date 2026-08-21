@@ -22,7 +22,7 @@
   `(let* ((genie-config-root (make-temp-file "genie-tests-repo" t))
           (genie--changed nil) (genie--created nil) (genie--verdict nil)
           (genie--pre nil) (genie--pre-dirty nil) (genie--pre-untracked nil)
-          (genie--wish nil))
+          (genie--wish nil) (genie--journal nil))
      (unwind-protect
          (progn
            (genie--git "init" "-q")
@@ -260,6 +260,58 @@
     ;; rebinding a register evicts the old spell in place
     (genie--bind-register ?3 'ignore)
     (should (eq (alist-get ?3 genie--registers) 'ignore))))
+
+(ert-deftest genie-undo-cast-effect ()
+  "A journaled cast is undone by `genie-undo' in the buffer it edited."
+  (let ((genie--journal nil))
+    (with-temp-buffer
+      (buffer-enable-undo)
+      (insert "hello\nworld\n")
+      (undo-boundary)
+      (genie--call-spell
+       (lambda () (interactive) (upcase-region (point-min) (point-max))))
+      (should (equal (buffer-string) "HELLO\nWORLD\n"))
+      (should (eq (caar genie--journal) 'cast))
+      (genie-undo)
+      (should (equal (buffer-string) "hello\nworld\n"))
+      (should-not genie--journal))))
+
+(ert-deftest genie-journal-skips-effectless-casts ()
+  "A cast that edits nothing leaves no journal entry."
+  (let ((genie--journal nil))
+    (with-temp-buffer
+      (buffer-enable-undo)
+      (genie--call-spell (lambda () (interactive) 'noop))
+      (should-not genie--journal))))
+
+(ert-deftest genie-cantrip-pipeline ()
+  "A cantrip turn executes immediately on the captured region and is undoable."
+  (let ((genie--turn 'cantrip) (genie--spell nil) (genie--spells nil)
+        (genie--busy t) (genie--changed nil) (genie--journal nil)
+        (genie--pending-register nil))
+    (with-temp-buffer
+      (buffer-enable-undo)
+      (insert "alpha\nbeta\n")
+      (undo-boundary)
+      (setq genie--cantrip-target
+            (list :buffer (current-buffer) :point (point-marker)
+                  :region (cons (copy-marker (point-min))
+                                (copy-marker (point-max)))))
+      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
+                ((symbol-function 'genie--insert-prompt) #'ignore))
+        (setq genie--answer
+              (concat "```elisp\n"
+                      "(defun genie-spell/upcase-it (beg end)\n"
+                      "  \"Upcase the region.\"\n"
+                      "  (interactive \"r\")\n"
+                      "  (upcase-region beg end))\n"
+                      "```"))
+        (genie--finish-turn))
+      (should (equal (buffer-string) "ALPHA\nBETA\n"))
+      (should (eq genie--spell 'genie-spell/upcase-it)) ; stays re-castable
+      (should (eq (caar genie--journal) 'cast))
+      (genie-undo)
+      (should (equal (buffer-string) "alpha\nbeta\n")))))
 
 (provide 'genie-tests)
 ;;; genie-tests.el ends here

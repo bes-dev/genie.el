@@ -42,6 +42,18 @@ conjuring, you pick a digit (or `RET` to skip) and the spell lands on
 language as the day demands. `C-c g x` always casts the most recent spell;
 `C-u C-c g x` lists every spell of the session with its register.
 
+At the fully ephemeral end there are **cantrips** — minor magic, cast
+instantly, no slot: `C-c g !` *"transpose these two columns"* generates the
+command and executes it right where you asked, on the active region when
+there is one. The command stays armed afterwards, so a cantrip that earned
+its keep can be re-cast, slotted into a register, or promoted to the config.
+
+**One undo for everything**: `genie-undo` pops the most recent genie-made
+change from a session journal, whatever it was — an applied wish (reverted
+via `git revert` and re-reloaded) or the buffer effect of a spell, register
+cast or cantrip (undone precisely in the buffer it edited, even if you've
+moved elsewhere since).
+
 The UI never blocks: the agent runs as an async subprocess, tokens and tool
 activity stream live into the `*genie*` transcript (which doubles as a
 multi-turn chat via `M-x genie-chat`).
@@ -102,6 +114,7 @@ and nothing else. Everything it will ever have arrives as a wish.
 (global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
 (global-set-key (kbd "C-c g s") #'genie-spell)   ; conjure an ephemeral command
 (global-set-key (kbd "C-c g x") #'genie-cast)    ; cast the current spell
+(global-set-key (kbd "C-c g !") #'genie-cantrip) ; one-shot: conjure and run here
 (global-set-key (kbd "C-c g m") #'genie-manual)  ; the manual, grown wish by wish
 (dotimes (i 10)                                  ; ten programmable spell registers
   (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))
@@ -170,11 +183,12 @@ an empty `init.el` with nothing but genie in it:
 | `genie` | `C-c g g` | State a wish from the minibuffer |
 | `genie-chat` | `C-c g c` | Transcript as a multi-turn chat (RET sends) |
 | `genie-diff` | `C-c g d` | Review the pending diff (`a` apply, `r` reject) |
-| `genie-undo` | `C-c g u` | Revert the last applied wish and reload |
+| `genie-undo` | `C-c g u` | Undo the last genie-made change, whatever its kind |
 | `genie-abort` | `C-c g k` | Abort the turn in flight |
 | `genie-spell` | `C-c g s` | Conjure an ephemeral command from a request |
 | `genie-cast` | `C-c g x` | Invoke the current spell (`C-u` picks among all) |
 | `genie-cast-register` | `C-c g 1`…`0` | Cast the spell stored in that register |
+| `genie-cantrip` | `C-c g !` | Conjure a one-shot command and run it right here |
 | `genie-spell-bind` | — | Put a conjured spell into a register |
 | `genie-spell-keep` | — | Make the current spell permanent |
 | `genie-manual` | `C-c g m` | Open the config's user manual, grown wish by wish |

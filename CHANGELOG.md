@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.4.0] — 2026-08-21
+
+Cantrips and one undo for everything.
+
+- New: `genie-cantrip` — conjure a one-shot command and execute it
+  immediately where it was asked from (active region respected, target
+  captured at request time). The command stays armed afterwards, so a
+  good cantrip can be re-cast, slotted into a register, or kept.
+- `genie-undo` is now unified: a session journal records every
+  genie-made change, and undo pops the newest one whatever it was — an
+  applied wish (`git revert` + reload) or the buffer effect of a spell,
+  register cast or cantrip (reverted precisely via the buffer's undo
+  history, with a confirmation when later edits would revert too). With
+  an empty journal it falls back to reverting a genie commit at HEAD.
+
 ## [0.3.0] — 2026-08-20
 
 Spell registers, in the spirit of `C-x r`.

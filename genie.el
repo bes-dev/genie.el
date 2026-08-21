@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -29,12 +29,17 @@
 ;; Emacs configuration.  The change is validated (a batch subprocess must
 ;; load init.el cleanly), reviewed as a git diff, committed as
 ;; "genie: <wish>" and hot-reloaded on accept — or restored on reject.
-;; `genie-undo' reverts the last applied wish.
 ;;
 ;; Spells are the ephemeral counterpart: `genie-spell' conjures an
 ;; interactive command from a request, evaluates it straight into the
-;; running session (nothing touches disk) and arms it on `genie-cast';
-;; `genie-spell-keep' turns the current spell into a permanent wish.
+;; running session (nothing touches disk) and arms it on `genie-cast' and
+;; a chosen digit register; `genie-cantrip' conjures a one-shot command
+;; and executes it immediately where it was asked from; `genie-spell-keep'
+;; turns the current spell into a permanent wish.
+;;
+;; `genie-undo' undoes the most recent genie-made change, whatever its
+;; kind: an applied wish (git revert + reload) or the buffer effect of a
+;; spell, register cast or cantrip.
 ;;
 ;; Everything is async, built on the genie-rpc library, with two agent
 ;; backends (`genie-backend'): the Pi coding agent and the elmee agent
@@ -52,6 +57,7 @@
 ;;   (global-set-key (kbd "C-c g k") #'genie-abort)
 ;;   (global-set-key (kbd "C-c g s") #'genie-spell)
 ;;   (global-set-key (kbd "C-c g x") #'genie-cast)
+;;   (global-set-key (kbd "C-c g !") #'genie-cantrip)
 ;;   (global-set-key (kbd "C-c g m") #'genie-manual)
 ;;   (dotimes (i 10)                       ; ten programmable spell registers
 ;;     (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))
@@ -141,6 +147,12 @@ the features and keybindings each wish added.  Open it with `genie-manual'."
 (defvar genie--spells nil "Alist of (COMMAND . CODE) conjured this session, newest first.")
 (defvar genie--registers nil "Alist of (DIGIT-CHAR . COMMAND) spell registers.")
 (defvar genie--pending-register nil "Register chosen for the spell being conjured.")
+(defvar genie--cantrip-target nil "Plist locating where the pending cantrip lands.")
+(defvar genie--journal nil
+  "Stack of genie-made changes, newest first, popped by `genie-undo'.
+An entry is (wish . COMMIT-SUBJECT) for an applied config wish, or
+\(cast BUFFER PRE POST FN) for a spell invocation that edited BUFFER,
+where PRE and POST are its `buffer-undo-list' before and after.")
 
 ;;;; Git plumbing
 
@@ -402,11 +414,12 @@ workspace permission mode; anything that does is not genie's business."
   (force-mode-line-update t)
   (genie--detect-changes)
   (cond
-   ((eq genie--turn 'spell)
-    (setq genie--turn 'wish)
-    (when genie--changed             ; a spell must not touch disk — surface it
-      (message "⚠ the spell also touched files — review with M-x genie-diff"))
-    (genie--learn-spell genie--answer))
+   ((memq genie--turn '(spell cantrip))
+    (let ((cast-now (eq genie--turn 'cantrip)))
+      (setq genie--turn 'wish)
+      (when genie--changed           ; a spell must not touch disk — surface it
+        (message "⚠ the spell also touched files — review with M-x genie-diff"))
+      (genie--learn-spell genie--answer cast-now)))
    ((null genie--changed)
     (setq genie--verdict nil)
     (display-buffer (genie--buffer))
@@ -555,6 +568,8 @@ The config must still boot cleanly with the pending edits in place."
     (user-error "Genie: not applied"))
   (apply #'genie--git "commit" "-m" (format "genie: %s" genie--wish)
          "--" genie--changed)
+  (push (cons 'wish (car (split-string (format "genie: %s" genie--wish) "\n")))
+        genie--journal)
   (let ((files genie--changed))
     (genie--reset)
     (genie--quit-diff)
@@ -580,21 +595,75 @@ The config must still boot cleanly with the pending edits in place."
   (genie--quit-diff)
   (message "🧞 wish rejected — config restored"))
 
-;;;###autoload
-(defun genie-undo ()
-  "Revert the last applied wish (HEAD must be a genie commit) and reload."
-  (interactive)
-  (let ((subject (genie--git "log" "-1" "--format=%s")))
-    (unless (string-prefix-p "genie: " subject)
-      (user-error "Genie: HEAD is not a genie commit (%s)" subject))
+(defun genie--undo-wish (subject)
+  "Revert the newest genie commit; SUBJECT, when given, must match HEAD."
+  (let ((head (genie--git "log" "-1" "--format=%s")))
+    (unless (string-prefix-p "genie: " head)
+      (user-error "Genie: HEAD is not a genie commit (%s)" head))
+    (when (and subject (not (equal subject head)))
+      (user-error "Genie: HEAD moved since that wish (now at: %s)" head))
     (let ((files (split-string (genie--git "diff" "--name-only" "HEAD~" "HEAD")
                                "\n" t)))
       (genie--git "revert" "--no-edit" "HEAD")
-      (message "🧞 reverted: %s" subject)
+      (message "🧞 reverted: %s" head)
       (genie--reload
        (cl-remove-if-not
         (lambda (f) (file-exists-p (expand-file-name f (genie--root))))
         files)))))
+
+;;;###autoload
+(defun genie-undo ()
+  "Undo the most recent genie-made change, whatever its kind.
+An applied wish is reverted with `git revert' and its files re-reloaded;
+the buffer effect of a spell, register cast or cantrip is undone in the
+buffer it edited.  When the session journal is empty (a fresh Emacs),
+falls back to reverting HEAD if it is a genie commit."
+  (interactive)
+  (let ((entry (car genie--journal)))
+    (pcase entry
+      (`(cast . ,_) (genie--undo-cast entry))
+      (`(wish . ,subject) (genie--undo-wish subject))
+      (_ (genie--undo-wish nil)))
+    (when entry (pop genie--journal))))
+
+;;;; The undo journal — one `genie-undo' for every kind of change
+
+(defun genie--call-spell (fn)
+  "Invoke spell FN interactively, journaling its buffer edits for `genie-undo'."
+  (let ((buf (current-buffer)) pre)
+    (undo-boundary)
+    (setq pre buffer-undo-list)
+    (unwind-protect (call-interactively fn)
+      (when (buffer-live-p buf)
+        (with-current-buffer buf
+          (undo-boundary)
+          (unless (or (eq buffer-undo-list t) (eq buffer-undo-list pre))
+            (push (list 'cast buf pre buffer-undo-list fn) genie--journal)))))))
+
+(defun genie--undo-prefix (list tail)
+  "Return the entries of undo LIST that precede TAIL, or nil if TAIL is gone."
+  (let (acc)
+    (while (and list (not (eq list tail)))
+      (push (car list) acc)
+      (setq list (cdr list)))
+    (and list (nreverse acc))))
+
+(defun genie--undo-cast (entry)
+  "Undo the buffer effect recorded in cast ENTRY."
+  (pcase-let ((`(cast ,buf ,pre ,post ,fn) entry))
+    (if (not (buffer-live-p buf))
+        (message "🧞 %s's buffer is gone — nothing left to undo there" fn)
+      (with-current-buffer buf
+        (when (and (not (eq buffer-undo-list post))
+                   (not (y-or-n-p
+                         (format "Edits made after %s revert too — continue? "
+                                 fn))))
+          (user-error "Genie: not undone"))
+        (let ((entries (genie--undo-prefix buffer-undo-list pre)))
+          (unless entries
+            (user-error "Genie: undo history for %s was truncated" fn))
+          (primitive-undo (1+ (cl-count nil entries)) entries)
+          (message "🧞 undone: %s in %s" fn (buffer-name)))))))
 
 ;;;; Spells — ephemeral conjured commands, nothing on disk
 
@@ -633,8 +702,9 @@ The config must still boot cleanly with the pending edits in place."
     (unless (eq old fn) (message "🧞 register %c: %s evicted" digit old)))
   (setf (alist-get digit genie--registers) fn))
 
-(defun genie--learn-spell (answer)
-  "Extract the conjured command from ANSWER, eval it and make it current."
+(defun genie--learn-spell (answer &optional cast-now)
+  "Extract the conjured command from ANSWER, eval it and make it current.
+With CAST-NOW (a cantrip), immediately invoke it where it was asked from."
   (condition-case err
       (let* ((code (string-trim (genie--extract-elisp answer)))
              (fn (genie--eval-spell code)))
@@ -642,10 +712,12 @@ The config must still boot cleanly with the pending edits in place."
         (setq genie--spell fn)
         (when genie--pending-register
           (genie--bind-register genie--pending-register fn))
-        (message "🧞 spell armed: %s — cast with M-x genie-cast%s" fn
-                 (if genie--pending-register
-                     (format " or register %c" genie--pending-register)
-                   "")))
+        (if cast-now
+            (genie--cast-at-target fn)
+          (message "🧞 spell armed: %s — cast with M-x genie-cast%s" fn
+                   (if genie--pending-register
+                       (format " or register %c" genie--pending-register)
+                     ""))))
     (error (display-buffer (genie--buffer))
            (message "🧞 spell failed: %s" (error-message-string err))))
   (setq genie--pending-register nil))
@@ -673,6 +745,58 @@ reading, docstring in the user's language, name it \
 `genie-spell/<short-name>'. No commentary outside the code block." request)
    (format "spell: %s" request)))
 
+(defun genie--cast-at-target (fn)
+  "Invoke cantrip FN in the buffer (and on the region) it was asked from."
+  (let* ((target genie--cantrip-target)
+         (buf (plist-get target :buffer))
+         (region (plist-get target :region)))
+    (setq genie--cantrip-target nil)
+    (if (not (buffer-live-p buf))
+        (message "🧞 %s armed, but its buffer is gone — cast it manually" fn)
+      (with-current-buffer buf
+        (if region
+            (progn (goto-char (cdr region))
+                   (push-mark (car region) t t))
+          (goto-char (plist-get target :point)))
+        (genie--call-spell fn)
+        (message "🧞 %s — M-x genie-undo reverts it" fn)))))
+
+;;;###autoload
+(defun genie-cantrip (request)
+  "Conjure and IMMEDIATELY execute a one-shot command implementing REQUEST.
+The generated command runs right where it was asked from — this buffer,
+on the active region when there is one.  Its effect is reverted by
+`genie-undo'; the command also stays armed as the current spell, so a
+cantrip worth repeating can be re-cast (`genie-cast'), slotted into a
+register (`genie-spell-bind') or made permanent (`genie-spell-keep')."
+  (interactive (list (string-trim (read-string "🧞 Cantrip (do right now): "))))
+  (when genie--busy (user-error "Genie is busy (M-x genie-abort interrupts)"))
+  (when (string-empty-p request) (user-error "Empty cantrip"))
+  (setq genie--turn 'cantrip
+        genie--cantrip-target
+        (list :buffer (current-buffer)
+              :point (point-marker)
+              :region (when (use-region-p)
+                        (cons (copy-marker (region-beginning))
+                              (copy-marker (region-end))))))
+  (genie--submit
+   (format "CANTRIP MODE — a one-shot action; do NOT edit, create or run \
+anything: this is pure code generation. Reply with ONLY one Emacs Lisp code \
+block containing a single interactive `defun' (a command) implementing: %s. \
+The command will be executed IMMEDIATELY in the buffer it was requested \
+from — major mode `%s', %s. Requirements: self-contained (built-ins and \
+already-loaded libraries only), safe under lexical binding, a proper \
+docstring in the user's language, name it `genie-spell/<short-name>'. No \
+commentary outside the code block."
+           request major-mode
+           (if (use-region-p)
+               (format "an active region of %d characters (take its bounds \
+with (interactive \"r\"))"
+                       (- (region-end) (region-beginning)))
+             "no active region — act at point or on the whole buffer, \
+whichever the request implies"))
+   (format "cantrip: %s" request)))
+
 ;;;###autoload
 (defun genie-cast (&optional pick)
   "Invoke the current conjured command; with prefix arg PICK, choose among them."
@@ -690,7 +814,7 @@ reading, docstring in the user's language, name it \
       (setq genie--spell (cdr (assoc choice cands)))))
   (unless (commandp genie--spell)
     (user-error "Genie: no spell armed — conjure one with M-x genie-spell"))
-  (call-interactively genie--spell))
+  (genie--call-spell genie--spell))
 
 ;;;###autoload
 (defun genie-cast-register (&optional digit)
@@ -705,7 +829,7 @@ binding this to \\`C-c g 1' .. \\`C-c g 0' gives ten programmable keys."
     (unless fn
       (user-error "Genie: register %c is empty — fill it with M-x genie-spell"
                   digit))
-    (call-interactively fn)))
+    (genie--call-spell fn)))
 
 ;;;###autoload
 (defun genie-spell-bind ()
