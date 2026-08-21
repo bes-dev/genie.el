@@ -258,6 +258,16 @@
     (should-error (genie-reject) :type 'user-error)
     (should-error (genie-undo) :type 'user-error)))
 
+(ert-deftest genie-indicator-heals-stale-values ()
+  "Install repairs a `genie--mode-line' left bound by an older genie."
+  (let ((genie--mode-line '(:eval "stale 0.6.1 construct"))
+        (global-mode-string nil))
+    (genie--install-indicator)
+    (should (eq genie--mode-line genie--mode-line-construct))
+    (should (memq 'genie--mode-line global-mode-string))
+    (genie--install-indicator)                  ; idempotent
+    (should (= 1 (cl-count 'genie--mode-line global-mode-string)))))
+
 (ert-deftest genie-spinner-follows-state ()
   "The spinner timer runs while genie works and stops when it is quiet."
   (let ((genie--state 'idle) (genie--spinner-timer nil)

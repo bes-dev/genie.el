@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.7.1
+;; Version: 0.7.2
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -216,10 +216,13 @@ With VERBOSE, thinking also names the abort key of the chat buffer."
   (let ((activity (genie--activity)))
     (if activity (concat " " activity) "")))
 
-(defvar genie--mode-line '(:eval (genie--mode-line-string))
+(defconst genie--mode-line-construct '(:eval (genie--mode-line-string))
+  "The canonical global-indicator construct, a trampoline into a function.")
+
+(defvar genie--mode-line genie--mode-line-construct
   "Mode-line construct showing genie activity in every buffer.
-A stable trampoline into `genie--mode-line-string': `defvar' keeps its
-old value across a reload, so this value must never need to change.")
+`genie--install-indicator' re-canonicalizes this on every turn, healing
+values left bound by an older genie in a hot-reloaded session.")
 (put 'genie--mode-line 'risky-local-variable t)
 
 (defun genie--spinner-tick ()
@@ -252,7 +255,11 @@ old value across a reload, so this value must never need to change.")
     (_ nil)))
 
 (defun genie--install-indicator ()
-  "Add the genie activity element to `global-mode-string' once."
+  "Add the genie activity element to `global-mode-string' once.
+Also heal a `genie--mode-line' value left bound by an older genie:
+`defvar' keeps old values across a hot reload, and a stale static
+construct is what a frozen spinner looks like."
+  (setq genie--mode-line genie--mode-line-construct)
   (cond ((not (listp global-mode-string))
          (setq global-mode-string (list "" global-mode-string 'genie--mode-line)))
         ((not (memq 'genie--mode-line global-mode-string))
@@ -432,6 +439,12 @@ The agent's stderr tail is surfaced so a startup failure has a reason."
 
 ;;;; Transcript buffer / turns
 
+(defconst genie--chat-mode-line
+  '(" " (:propertize "%b" face mode-line-buffer-id)
+    (:eval (let ((activity (genie--activity t)))
+             (if activity (concat "  " activity) ""))))
+  "Mode-line format of the chat buffer, shared so it can be healed.")
+
 (defvar genie-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'genie-send)
@@ -444,10 +457,7 @@ The agent's stderr tail is surfaced so a startup failure has a reason."
   "Chat with the config genie; RET sends, \\[genie-abort] aborts.
 Killing this buffer only discards the transcript view — the agent
 session lives on; `genie-quit' ends it."
-  (setq-local mode-line-format
-              '(" " (:propertize "%b" face mode-line-buffer-id)
-                (:eval (let ((activity (genie--activity t)))
-                         (if activity (concat "  " activity) "")))))
+  (setq-local mode-line-format genie--chat-mode-line)
   (visual-line-mode 1))
 
 (defun genie--insert-prompt ()
@@ -461,6 +471,7 @@ session lives on; `genie-quit' ends it."
   (let ((buf (get-buffer-create genie-buffer)))
     (with-current-buffer buf
       (unless (derived-mode-p 'genie-mode) (genie-mode))
+      (setq-local mode-line-format genie--chat-mode-line) ; heal after reload
       (when (= (point-min) (point-max))
         (insert (propertize "🧞 genie — wishes edit this very Emacs config"
                             'face 'shadow))

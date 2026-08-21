@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.7.2] — 2026-08-22
+
+- The activity indicator now heals itself: on every turn, genie
+  re-canonicalizes the global mode-line construct and the chat buffer's
+  local format, so a session that hot-reloaded genie across versions
+  (where `defvar' keeps the old bound value — a frozen spinner) fixes
+  itself on the next wish, no restart needed.
+
 ## [0.7.1] — 2026-08-22
 
 - The global mode-line indicator is now a stable trampoline into a
