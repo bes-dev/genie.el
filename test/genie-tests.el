@@ -396,6 +396,50 @@
       (should (equal (buffer-string) "hello\nworld\n"))
       (should-not genie--journal))))
 
+(ert-deftest genie-undo-cast-survives-truncated-history ()
+  "GC dropping the pre-cast tail must not strand the journal entry.
+When nothing changed since the cast, its groups are the list head and
+are undone whole even though the recorded tail is gone."
+  (let ((genie--journal nil) (genie--state 'idle))
+    (with-temp-buffer
+      (buffer-enable-undo)
+      (insert "aged history\n")
+      (undo-boundary)
+      (genie--call-spell
+       'test (lambda () (interactive) (upcase-region (point-min) (point-max))))
+      (should (equal (buffer-string) "AGED HISTORY\n"))
+      ;; emulate truncate_undo_list: cut the tail in place, head cons intact
+      (pcase-let ((`(cast ,_ ,pre ,_ ,_) (car genie--journal)))
+        (let ((cons buffer-undo-list))
+          (while (not (eq (cdr cons) pre)) (setq cons (cdr cons)))
+          (setcdr cons nil)))
+      (genie-undo)
+      (should (equal (buffer-string) "aged history\n"))
+      (should-not genie--journal))))
+
+(ert-deftest genie-undo-cast-tolerates-rebuilt-history ()
+  "A rebuilt undo list (buffer revert) drops the entry with a message.
+The effect is gone with the revert; undo must not error or strand it."
+  (let ((genie--journal nil) (genie--state 'idle))
+    (with-temp-buffer
+      (buffer-enable-undo)
+      (insert "x\n")
+      (undo-boundary)
+      (genie--call-spell
+       'test (lambda () (interactive) (upcase-region (point-min) (point-max))))
+      (setq buffer-undo-list '(nil))    ; what a revert leaves behind
+      (genie-undo)                      ; no error, entry consumed
+      (should-not genie--journal))))
+
+(ert-deftest genie-undo-empty-journal-message ()
+  "With an empty journal and a foreign HEAD, undo explains itself."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (let ((err (should-error (genie-undo) :type 'user-error)))
+      (should (string-match-p "journal is empty" (cadr err))))))
+
 (ert-deftest genie-journal-skips-effectless-casts ()
   "A cast that edits nothing leaves no journal entry."
   (let ((genie--journal nil))

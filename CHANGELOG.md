@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.6.1] — 2026-08-21
+
+Field fixes for the unified undo, from a first day of real use.
+
+- `genie-undo` of a cast no longer strands the journal entry when the
+  buffer's undo history has aged: a tail truncated by GC (buffer
+  untouched since the cast) is undone whole from the list head, and a
+  history rebuilt by a buffer revert is reported as "the effect is
+  already gone" and consumed instead of erroring forever.
+- A cantrip that merely reports something (or runs in an undo-disabled
+  buffer, like dired) no longer promises "genie-undo reverts it" — the
+  promise appears only when a journal entry actually exists.
+- Undo with an empty journal and a foreign HEAD now says plainly that
+  there is nothing to undo, instead of "HEAD is not a genie commit".
+
 ## [0.6.0] — 2026-08-21
 
 Elmee speaks the Agent Client Protocol and becomes the default backend.

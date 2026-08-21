@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.6.0
+;; Version: 0.6.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -713,21 +713,33 @@ timeout rather than as a config failure."
     (and list (nreverse acc))))
 
 (defun genie--undo-cast (entry)
-  "Undo the buffer effect recorded in cast ENTRY."
+  "Undo the buffer effect recorded in cast ENTRY.
+Robust against an undo history that has aged: when garbage collection
+has truncated the recorded tail away but the buffer is untouched since
+the cast, the cast's changes are still the head of the list and are
+undone whole; a history rebuilt from scratch (a buffer revert) means
+the effect is already gone, which is reported instead of erroring."
   (pcase-let ((`(cast ,buf ,pre ,post ,name) entry))
     (if (not (buffer-live-p buf))
         (message "🧞 %s's buffer is gone — nothing left to undo there" name)
       (with-current-buffer buf
-        (when (and (not (eq buffer-undo-list post))
-                   (not (y-or-n-p
-                         (format "Edits made after %s revert too — continue? "
-                                 name))))
-          (user-error "Genie: not undone"))
         (let ((entries (genie--undo-prefix buffer-undo-list pre)))
-          (unless entries
-            (user-error "Genie: undo history for %s was truncated" name))
-          (primitive-undo (1+ (cl-count nil entries)) entries)
-          (message "🧞 undone: %s in %s" name (buffer-name)))))))
+          (cond
+           (entries                     ; the recorded tail is still in place
+            (when (and (not (eq buffer-undo-list post))
+                       (not (y-or-n-p
+                             (format "Edits made after %s revert too — continue? "
+                                     name))))
+              (user-error "Genie: not undone"))
+            (primitive-undo (1+ (cl-count nil entries)) entries)
+            (message "🧞 undone: %s in %s" name (buffer-name)))
+           ((eq buffer-undo-list post)  ; untouched since; older history GC'd
+            (primitive-undo (1+ (cl-count nil buffer-undo-list))
+                            buffer-undo-list)
+            (message "🧞 undone: %s in %s" name (buffer-name)))
+           (t                           ; rebuilt from scratch — revert did it
+            (message "🧞 %s: %s's undo history was rebuilt (reverted?) — the \
+effect is already gone; C-/ if not" name (buffer-name)))))))))
 
 (defun genie--undo-wish (subject)
   "Revert the newest genie commit; SUBJECT, when given, must match HEAD.
@@ -735,7 +747,10 @@ Without SUBJECT (the empty-journal fallback) the revert is confirmed
 first — undoing \"the last thing\" must never surprise-revert a commit."
   (let ((head (genie--git "log" "-1" "--format=%s")))
     (unless (string-prefix-p "genie: " head)
-      (user-error "Genie: HEAD is not a genie commit (%s)" head))
+      (if subject
+          (user-error "Genie: HEAD is not a genie commit (%s)" head)
+        (user-error "Genie: nothing to undo — the session journal is empty \
+and HEAD is not a genie commit")))
     (when (and subject (not (equal subject head)))
       (user-error "Genie: HEAD moved since that wish (now at: %s)" head))
     (unless (or subject
@@ -928,8 +943,13 @@ reading, docstring in the user's language, name it \
             (progn (goto-char (cdr region))
                    (push-mark (car region) t t))
           (goto-char (plist-get target :point)))
-        (genie--call-spell name (genie--spell-fn entry))
-        (message "🧞 %s — M-x genie-undo reverts it" name)))))
+        (let ((before genie--journal))
+          (genie--call-spell name (genie--spell-fn entry))
+          ;; Promise an undo only when there is an effect to undo — a
+          ;; cantrip that merely reported something leaves no journal entry.
+          (if (eq genie--journal before)
+              (message "🧞 %s" name)
+            (message "🧞 %s — M-x genie-undo reverts it" name)))))))
 
 ;;;###autoload
 (defun genie-cantrip (request)
