@@ -410,7 +410,7 @@ validates, commits and hot-reloads your edits itself."
         (genie--emit trimmed)))))
 
 (defun genie--on-tool (name)
-  "Log tool NAME to the transcript; the mode line shows just the spinner.
+  "Log tool NAME to the transcript, leaving the mode line to the spinner.
 The play-by-play belongs in the `*genie*' log — not in the echo area,
 where it would clobber whatever the user is doing there."
   (setq genie--tool name)
