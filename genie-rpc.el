@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -61,7 +61,7 @@
 
 (cl-defstruct (genie-rpc-session (:constructor genie-rpc--session) (:copier nil))
   "A live (or lazily started) RPC connection to a coding agent."
-  backend command directory proc (acc "") spent handlers)
+  backend command directory proc (acc "") spent handlers stderr)
 
 (defvar genie-rpc-backends
   '((pi :persistent t
@@ -140,6 +140,20 @@ a lingering process may hold locks (for example on a session file)."
                                    (delete-process proc)))))
         (delete-process proc)))))
 
+(defun genie-rpc-stderr (rpc &optional lines)
+  "Return the last LINES (default 10) of RPC's agent stderr, or nil.
+The stderr of the agent process is collected separately from the JSONL
+stream, so a startup failure has a readable reason."
+  (when-let* ((buf (and rpc (genie-rpc-session-stderr rpc))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (save-excursion
+          (goto-char (point-max))
+          (forward-line (- (or lines 10)))
+          (let ((tail (string-trim
+                       (buffer-substring-no-properties (point) (point-max)))))
+            (unless (string-empty-p tail) tail)))))))
+
 (defun genie-rpc-respond (rpc id response)
   "Answer the interaction request ID on session RPC with RESPONSE.
 RESPONSE is a backend-specific plist; for elmee, for example,
@@ -164,15 +178,26 @@ RESPONSE is a backend-specific plist; for elmee, for example,
   (when (and (genie-rpc-live-p rpc)
              (not (genie-rpc--spec rpc :persistent))
              (genie-rpc-session-spent rpc))
-    (delete-process (genie-rpc-session-proc rpc)))
+    ;; A deliberate respawn is not a death worth announcing.
+    (let ((old (genie-rpc-session-proc rpc)))
+      (set-process-sentinel old #'ignore)
+      (delete-process old)))
   (unless (genie-rpc-live-p rpc)
-    (let ((default-directory (genie-rpc-session-directory rpc)))
+    (let ((default-directory (genie-rpc-session-directory rpc))
+          (errbuf (or (and (buffer-live-p (genie-rpc-session-stderr rpc))
+                           (genie-rpc-session-stderr rpc))
+                      (setf (genie-rpc-session-stderr rpc)
+                            (generate-new-buffer " *genie-rpc stderr*")))))
+      (with-current-buffer errbuf (erase-buffer))
       (setf (genie-rpc-session-acc rpc) ""
             (genie-rpc-session-spent rpc) nil
             (genie-rpc-session-proc rpc)
             (make-process
              :name "genie-rpc" :buffer nil :noquery t :connection-type 'pipe
              :command (genie-rpc-session-command rpc)
+             :stderr (make-pipe-process :name "genie-rpc-stderr"
+                                        :buffer errbuf :noquery t
+                                        :sentinel #'ignore)
              :filter (lambda (_proc string) (genie-rpc--filter rpc string))
              :sentinel (lambda (proc _event) (genie-rpc--sentinel rpc proc)))))))
 

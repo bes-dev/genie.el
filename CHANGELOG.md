@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.5.0] — 2026-08-21
+
+Hardening: an explicit state machine and honest guardrails everywhere.
+
+- The turn lifecycle is now an explicit state machine (`idle → thinking
+  → validating → reviewing`): entry points refuse cleanly before input
+  is read, a stale diff cannot be applied while a refinement streams,
+  a late validation callback cannot clobber a newer cycle, and a failed
+  submit rolls the turn state back.
+- Conjured code is screened before evaluation: calls to processes, the
+  network, file deletion and friends (`genie-spell-risky-functions`)
+  need explicit confirmation; a declined spell is never evaluated.
+- `genie-undo` with an empty journal now *offers* the git revert instead
+  of silently performing it; new `genie-journal` previews the stack;
+  reverting a wish notes that loaded definitions survive until restart.
+- Spells are stored as entries with captured function objects: a newer
+  spell reusing a name no longer silently changes what old registers do,
+  and duplicate names are labeled `name<2>` in pick lists.
+- Agent stderr is captured separately (genie-rpc 0.2.0) and its tail is
+  shown when the process dies, so a backend startup failure has a
+  readable reason; a deliberate elmee respawn no longer risks a spurious
+  "process exited" salvage.
+- Activity is visible in every mode line via `global-mode-string`;
+  killing the `*genie*` buffer no longer kills the agent session — new
+  `genie-quit` does that deliberately; validation timeout is
+  customizable (`genie-validate-timeout`) and reported as a timeout,
+  not a config failure.
+
 ## [0.4.0] — 2026-08-21
 
 Cantrips and one undo for everything.

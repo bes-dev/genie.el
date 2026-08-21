@@ -175,6 +175,20 @@ an empty `init.el` with nothing but genie in it:
 - **Spells never touch disk** — a generated `defun` only defines a command;
   side effects happen when *you* cast it. If a spell turn did touch files,
   genie warns and routes the changes into the usual review.
+- **Risky code is screened** — conjured code that calls processes, the
+  network, file deletion or anything else in `genie-spell-risky-functions`
+  needs explicit confirmation *before it is evaluated*; everything else
+  stays instant.
+- **Undo never surprises** — `genie-undo` pops a session journal of
+  genie-made changes; with an empty journal (a fresh Emacs) it *offers* to
+  revert a genie commit at HEAD instead of silently doing so.
+  `genie-journal` previews the stack.
+- **An explicit turn state machine** (`idle → thinking → validating →
+  reviewing`) guards every entry point: you cannot apply a stale diff while
+  the agent is rewriting it, start a turn mid-validation, or lose typed
+  input to a busy error after the fact. Activity is visible in every mode
+  line, and if the agent process dies, its stderr tail lands in the
+  transcript so the failure has a reason.
 
 ## Commands
 
@@ -192,6 +206,8 @@ an empty `init.el` with nothing but genie in it:
 | `genie-spell-bind` | — | Put a conjured spell into a register |
 | `genie-spell-keep` | — | Make the current spell permanent |
 | `genie-manual` | `C-c g m` | Open the config's user manual, grown wish by wish |
+| `genie-journal` | — | Preview what `genie-undo` would undo, newest first |
+| `genie-quit` | — | End the agent session (fresh charter on the next wish) |
 
 Wishes stated while a diff is pending refine it: the review stays cumulative
 against the same restore point.
@@ -205,6 +221,8 @@ against the same restore point.
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
 | `genie-auto-apply` | `nil` | Skip review when validation passes |
 | `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
+| `genie-validate-timeout` | `120` | Seconds before batch validation is killed (package installs are slow) |
+| `genie-spell-risky-functions` | processes, network, deletion… | Calls a conjured spell must confirm |
 | `genie-pi-program`, `genie-pi-args`, `genie-pi-model` | | Pi invocation |
 | `genie-elmee-program`, `genie-elmee-args` | | elmee invocation |
 
