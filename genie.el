@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.5.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -44,8 +44,9 @@
 ;; spell, register cast or cantrip.  `genie-journal' previews the stack.
 ;;
 ;; Everything is async, built on the genie-rpc library, with two agent
-;; backends (`genie-backend'): the Pi coding agent and the elmee agent
-;; microkernel.  A turn's progress is visible in every mode line.
+;; backends (`genie-backend'): the elmee agent microkernel by default,
+;; driven over the standard Agent Client Protocol (`elmee --acp'), and
+;; the Pi coding agent.  A turn's progress is visible in every mode line.
 ;;
 ;; Setup:
 ;;
@@ -76,9 +77,11 @@
   :group 'tools
   :prefix "genie-")
 
-(defcustom genie-backend 'pi
-  "Agent backend: the Pi coding agent or the elmee microkernel agent."
-  :type '(choice (const pi) (const elmee))
+(defcustom genie-backend 'elmee
+  "Agent backend: the elmee microkernel agent (default) or the Pi agent.
+Elmee is driven over the standard Agent Client Protocol (`elmee --acp');
+Pi over its own line-delimited JSON RPC (`pi --mode rpc')."
+  :type '(choice (const elmee) (const pi))
   :group 'genie)
 
 (defcustom genie-pi-program "pi"
@@ -157,7 +160,6 @@ covers an agent turn in flight; `validating' the async batch check.")
 (defvar genie--tool nil "Name of the tool currently running.")
 (defvar genie--seen-text nil "Non-nil once the current turn emitted real text.")
 (defvar genie--ctxfile nil "Temp file holding Pi's system-prompt addendum.")
-(defvar genie--elmee-session nil "Elmee session file, carrying context across respawns.")
 (defvar genie--input-start nil "Marker where the chat input begins.")
 (defvar genie--wish nil "Wish text of the pending turn(s), used as commit message.")
 (defvar genie--wish-history nil "Minibuffer history for wishes.")
@@ -307,18 +309,10 @@ never touch `.git/'.
 validates, commits and hot-reloads your edits itself."
             root emacs-version genie-manual-file)))
 
-(defun genie--elmee-session-file ()
-  "Return (creating the name lazily) the shared elmee session file."
-  (or genie--elmee-session
-      (setq genie--elmee-session
-            (expand-file-name (format "genie-%d.jsonl" (emacs-pid))
-                              temporary-file-directory))))
-
 (defun genie--command ()
   "Return the agent argv for the configured backend, system prompt included."
   (pcase genie-backend
-    ('elmee (append (list genie-elmee-program "--rpc"
-                          "--session" (genie--elmee-session-file)
+    ('elmee (append (list genie-elmee-program "--acp"
                           "--append-system-prompt" (genie--context-prompt))
                     genie-elmee-args))
     (_ (setq genie--ctxfile
@@ -340,7 +334,6 @@ validates, commits and hot-reloads your edits itself."
                           :on-tool #'genie--on-tool
                           :on-done #'genie--on-done
                           :on-fail #'genie--on-fail
-                          :on-request #'genie--on-request
                           :on-exit #'genie--on-exit))))
 
 (defun genie--on-text (delta)
@@ -371,18 +364,6 @@ validates, commits and hot-reloads your edits itself."
   (genie--emit (format "\n[%s]\n" msg) 'error)
   (genie--finish-turn))
 
-(defun genie--on-request (request)
-  "Decline the agent's approval/question REQUEST — out of genie's mandate.
-Config edits inside the root need no approval under elmee's default
-workspace permission mode; anything that does is not genie's business."
-  (message "🧞 %s request denied — out of genie's scope"
-           (or (plist-get request :kind) "interaction"))
-  (genie-rpc-respond genie--rpc (plist-get request :id)
-                     (if (equal (plist-get request :kind) "approval")
-                         '(:outcome "deny"
-                           :value "genie may only edit files inside the config root")
-                       '(:outcome "cancel"))))
-
 (defun genie--on-exit ()
   "Handle the agent process dying; salvage a turn that was in flight.
 The agent's stderr tail is surfaced so a startup failure has a reason."
@@ -399,10 +380,9 @@ The agent's stderr tail is surfaced so a startup failure has a reason."
   (when genie--rpc
     (genie-rpc-close genie--rpc)
     (setq genie--rpc nil))
-  (dolist (file (list genie--ctxfile genie--elmee-session))
-    (when (and file (file-exists-p file))
-      (ignore-errors (delete-file file))))
-  (setq genie--elmee-session nil genie--turn 'wish
+  (when (and genie--ctxfile (file-exists-p genie--ctxfile))
+    (ignore-errors (delete-file genie--ctxfile)))
+  (setq genie--turn 'wish
         genie--cantrip-target nil genie--pending-register nil)
   (genie--set-state 'idle))
 

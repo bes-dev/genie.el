@@ -22,8 +22,8 @@ command -v git >/dev/null || { echo "genie: git is required." >&2; exit 1; }
 command -v emacs >/dev/null || { echo "genie: emacs not found on PATH." >&2; exit 1; }
 emacs --batch --eval '(kill-emacs (if (< emacs-major-version 29) 1 0))' ||
   echo "genie: warning — this init.el uses package-vc-install (Emacs 29+); on 28 clone the repo and use load-path instead." >&2
-command -v pi >/dev/null || command -v elmee >/dev/null ||
-  echo "genie: warning — no agent backend on PATH; install Pi (https://github.com/badlogic/pi-mono) or elmee (https://github.com/bes-dev/elmee)." >&2
+command -v elmee >/dev/null || command -v pi >/dev/null ||
+  echo "genie: warning — no agent backend on PATH; install elmee (https://github.com/bes-dev/elmee) or Pi (https://github.com/badlogic/pi-mono)." >&2
 
 mkdir -p "$EMACS_D"
 cat > "$EMACS_D/init.el" <<'EOF'
@@ -71,8 +71,8 @@ cat <<EOF
 genie: lamp ready at $EMACS_D
 
 Next:
-  1. Make sure an agent backend is installed (Pi by default; for elmee:
-     add (setq genie-backend 'elmee) to init.el — or wish it in later).
+  1. Make sure an agent backend is installed (elmee by default; for Pi:
+     add (setq genie-backend 'pi) to init.el — or wish it in later).
   2. Launch Emacs. The first start installs genie from GitHub.
   3. Rub the lamp: C-c g g — and don't waste wishes on trifles.
 EOF

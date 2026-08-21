@@ -52,11 +52,14 @@
 (ert-deftest genie-rpc-line-framing ()
   "JSON lines split across arbitrary chunks are reassembled."
   (let* ((texts nil)
-         (rpc (genie-tests--rpc 'elmee :on-text (lambda (s) (push s texts)))))
-    (genie-rpc--filter rpc "{\"type\":\"text\",\"te")
-    (genie-rpc--filter rpc "xt\":\"hel")
-    (genie-rpc--filter rpc "lo\"}\n{\"type\":\"text\",\"text\":\" world\"}\n")
-    (should (equal (nreverse texts) '("hello" " world")))))
+         (rpc (genie-tests--rpc 'pi :on-text (lambda (s) (push s texts))))
+         (line (concat "{\"type\":\"message_update\",\"assistantMessageEvent\":"
+                       "{\"type\":\"text_delta\",\"delta\":\"hello\"}}\n")))
+    (genie-rpc--filter rpc (substring line 0 40))
+    (genie-rpc--filter rpc (substring line 40 55))
+    (genie-rpc--filter rpc (substring line 55))
+    (genie-rpc--filter rpc line)
+    (should (equal (nreverse texts) '("hello" "hello")))))
 
 (ert-deftest genie-rpc-pi-events ()
   "Pi events normalize to on-text / on-tool / on-done."
@@ -74,22 +77,74 @@
     (should (equal (nreverse log)
                    '((tool . "edit") (text . "ok") (done . nil))))))
 
-(ert-deftest genie-rpc-elmee-events ()
-  "Elmee events normalize, including result answers and failures."
-  (let* ((log nil)
+(ert-deftest genie-rpc-acp-handshake-and-turn ()
+  "The full ACP cycle: handshake, queued prompt, streaming, stop reason."
+  (let* ((log nil) (sent nil)
          (rpc (genie-tests--rpc
                'elmee
                :on-text (lambda (s) (push (cons 'text s) log))
                :on-tool (lambda (s) (push (cons 'tool s) log))
                :on-done (lambda (a) (push (cons 'done a) log))
                :on-fail (lambda (m) (push (cons 'fail m) log)))))
+    (cl-letf (((symbol-function 'genie-rpc--send)
+               (lambda (_rpc msg) (push msg sent))))
+      ;; a prompt before the session is open waits in the queue
+      (genie-rpc--acp-prompt rpc "make it so")
+      (should (equal (genie-rpc-session-queue rpc) '("make it so")))
+      (genie-rpc--acp-hello rpc)
+      (let ((init (car (last sent))))
+        (should (equal (plist-get init :method) "initialize")))
+      ;; initialize answered → session/new goes out
+      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}\n")
+      (let ((new (car (last sent 1))))
+        (should (equal (plist-get (car sent) :method) "session/new"))
+        (should (stringp (plist-get (plist-get (car sent) :params) :cwd)))
+        (ignore new))
+      ;; session opened → the queued prompt is flushed with the sessionId
+      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"/tmp/s.jsonl\"}}\n")
+      (let ((prompt (car sent)))
+        (should (equal (plist-get prompt :method) "session/prompt"))
+        (should (equal (plist-get (plist-get prompt :params) :sessionId)
+                       "/tmp/s.jsonl"))
+        (should (equal (plist-get (aref (plist-get (plist-get prompt :params)
+                                                   :prompt)
+                                        0)
+                        :text)
+                       "make it so")))
+      ;; the turn streams as session/update notifications
+      (genie-rpc--filter
+       rpc (concat "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
+                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
+                   "{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"1\",\"title\":\"apply_patch init.el\"}}}\n"
+                   "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
+                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
+                   "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"done\"}}}}\n"
+                   "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
+                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
+                   "{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[]}}}\n"))
+      ;; the response to session/prompt ends the turn
+      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+      (should (equal (nreverse log)
+                     '((tool . "apply_patch init.el") (text . "done")
+                       (done . nil))))
+      ;; a request from the agent is declined without stalling the turn
+      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"elicitation/create\",\"params\":{}}\n")
+      (let ((reply (car sent)))
+        (should (equal (plist-get reply :id) "srv-1"))
+        (should (equal (plist-get (plist-get reply :result) :action)
+                       "cancel"))))))
+
+(ert-deftest genie-rpc-acp-prompt-refused ()
+  "A JSON-RPC error answering session/prompt fires on-fail."
+  (let* ((log nil)
+         (rpc (genie-tests--rpc
+               'elmee :on-fail (lambda (m) (push m log)))))
+    (cl-letf (((symbol-function 'genie-rpc--send) #'ignore))
+      (setf (genie-rpc-session-session-id rpc) "/tmp/s.jsonl")
+      (genie-rpc--acp-send-prompt rpc "hi"))
     (genie-rpc--filter
-     rpc (concat "{\"type\":\"protocol\",\"version\":1}\n"
-                 "{\"type\":\"tool_start\",\"id\":\"1\",\"name\":\"write\"}\n"
-                 "{\"type\":\"result\",\"answer\":\"done\"}\n"
-                 "{\"type\":\"error\",\"message\":\"boom\"}\n"))
-    (should (equal (nreverse log)
-                   '((tool . "write") (done . "done") (fail . "boom"))))))
+     rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"this session is already prompting\"}}\n")
+    (should (equal log '("this session is already prompting")))))
 
 (ert-deftest genie-rpc-unknown-backend ()
   "Opening an unregistered backend signals an error."

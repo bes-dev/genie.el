@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.6.0] — 2026-08-21
+
+Elmee speaks the Agent Client Protocol and becomes the default backend.
+
+- The elmee backend now drives `elmee --acp` — a warm JSON-RPC 2.0
+  server following the standard [ACP](https://agentclientprotocol.com):
+  `initialize` → `session/new` → `session/prompt`, turns streamed as
+  `session/update` notifications, aborts via `session/cancel`. The old
+  line-delimited elmee protocol (process-per-task, `--session` temp
+  file) is removed.
+- genie-rpc 0.3.0: a generic ACP client (request/response correlation,
+  handshake with a prompt queue until the session is open, agent
+  requests declined minimally), backends as function hooks
+  (`:hello`/`:prompt`/`:abort`/`:dispatch`), simplified close.
+- `genie-backend' defaults to `elmee'.
+
 ## [0.5.0] — 2026-08-21
 
 Hardening: an explicit state machine and honest guardrails everywhere.

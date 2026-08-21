@@ -1,10 +1,10 @@
-;;; genie-rpc.el --- Async duplex JSONL RPC to AI coding-agent CLIs -*- lexical-binding: t; -*-
+;;; genie-rpc.el --- Async RPC to AI coding-agent CLIs (ACP and JSONL) -*- lexical-binding: t; -*-
 
 ;; Copyright 2026 Sergei Belousov
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -25,27 +25,28 @@
 
 ;;; Commentary:
 
-;; Application-agnostic plumbing for driving AI coding agents that speak
-;; JSON lines over stdio.  A session normalizes each backend's event
-;; stream into a small set of handler callbacks and hides lifecycle
-;; differences, so an application never blocks the single-threaded UI
-;; and never parses agent-specific JSON itself.
+;; Application-agnostic plumbing for driving AI coding agents over stdio.
+;; A session normalizes each backend's wire protocol into a small set of
+;; handler callbacks, so an application never blocks the single-threaded
+;; UI and never parses agent-specific JSON itself.
 ;;
 ;; Two backends ship with the library, registered in `genie-rpc-backends':
 ;;
-;; - `pi'    — the Pi coding agent (`pi --mode rpc'): one persistent
-;;             process holds the whole conversation.
-;; - `elmee' — the elmee agent microkernel (`elmee --rpc'): one process
-;;             per task; callers keep context across tasks by passing an
-;;             `--session FILE' argument in the command.
+;; - `elmee' — the elmee agent microkernel serving the standard
+;;             Agent Client Protocol (`elmee --acp'): one warm JSON-RPC 2.0
+;;             server process, sessions opened with `session/new', turns
+;;             driven by `session/prompt' and streamed as `session/update'
+;;             notifications.
+;; - `pi'    — the Pi coding agent (`pi --mode rpc'): a line-delimited
+;;             JSON protocol of Pi's own, one persistent process.
 ;;
 ;; Adding a backend is adding an entry to `genie-rpc-backends': a prompt
-;; encoder, an event dispatcher, and lifecycle keywords.  No other code
-;; in this file is backend-specific.
+;; sender, an event dispatcher and optional handshake/abort hooks.  No
+;; other code in this file is backend-specific.
 ;;
 ;; Typical use:
 ;;
-;;   (setq rpc (genie-rpc-open 'pi (list "pi" "--mode" "rpc")
+;;   (setq rpc (genie-rpc-open 'elmee (list "elmee" "--acp")
 ;;                             :directory "~/project/"
 ;;                             :on-text (lambda (delta) ...)
 ;;                             :on-done (lambda (answer) ...)))
@@ -61,28 +62,30 @@
 
 (cl-defstruct (genie-rpc-session (:constructor genie-rpc--session) (:copier nil))
   "A live (or lazily started) RPC connection to a coding agent."
-  backend command directory proc (acc "") spent handlers stderr)
+  backend command directory proc (acc "") spent handlers stderr
+  (next-id 0) pending session-id queue)
 
 (defvar genie-rpc-backends
-  '((pi :persistent t
+  '((elmee :persistent t
+           :hello genie-rpc--acp-hello
+           :prompt genie-rpc--acp-prompt
+           :abort genie-rpc--acp-abort
+           :dispatch genie-rpc--acp-dispatch)
+    (pi :persistent t
         :prompt genie-rpc--pi-prompt
-        :abort (:type "abort")
-        :dispatch genie-rpc--pi-dispatch)
-    (elmee :persistent nil
-           :prompt genie-rpc--elmee-prompt
-           :abort nil
-           :stop (:type "stop")
-           :dispatch genie-rpc--elmee-dispatch))
+        :abort genie-rpc--pi-abort
+        :dispatch genie-rpc--pi-dispatch))
   "Registry of agent backends, keyed by symbol.
 Each entry is (NAME . PLIST) with:
   :persistent  non-nil when one process serves many prompts; nil when
                the agent runs one task per process and must be respawned
-  :prompt      function TEXT -> plist, the JSON line carrying a prompt
-  :abort       plist sent to interrupt a turn, or nil when the backend
-               has none (the process is then ended instead)
-  :stop        optional plist asking the process to exit gracefully
-  :dispatch    function (SESSION EVENT) translating one parsed event
-               plist into `genie-rpc--fire' handler calls.")
+  :hello       optional function (SESSION) run right after the process
+               starts, for protocols with a handshake
+  :prompt      function (SESSION TEXT) sending TEXT as the next turn
+  :abort       optional function (SESSION) interrupting the turn in
+               flight; without one the process is ended instead
+  :dispatch    function (SESSION MESSAGE) translating one parsed wire
+               message into `genie-rpc--fire' handler calls.")
 
 ;;;; Session lifecycle
 
@@ -90,11 +93,9 @@ Each entry is (NAME . PLIST) with:
   "Create a session for BACKEND, running COMMAND (an argv list).
 The process starts lazily on the first `genie-rpc-prompt'.  OPTS is a
 plist: `:directory' sets the working directory, and the handler keys
-`:on-text' (answer text delta), `:on-tool' (name of a starting tool),
-`:on-done' (final answer string or nil), `:on-fail' (error message),
-`:on-request' (interaction request plist, answer via `genie-rpc-respond';
-auto-cancelled when no handler is given) and `:on-exit' (no arguments,
-the process died) attach callbacks."
+`:on-text' (answer text delta), `:on-tool' (a starting tool's label),
+`:on-done' (final answer string or nil), `:on-fail' (error message) and
+`:on-exit' (no arguments, the process died) attach callbacks."
   (unless (assq backend genie-rpc-backends)
     (error "Unknown genie-rpc backend: %s" backend))
   (genie-rpc--session :backend backend :command command
@@ -110,39 +111,29 @@ the process died) attach callbacks."
 
 (defun genie-rpc-prompt (rpc text)
   "Send TEXT as the next user prompt on session RPC.
-Starts the agent process when needed; a spent one-task-per-process
-agent is replaced by a fresh one running the same command."
+Starts the agent process (and runs the backend's handshake) when
+needed; a spent one-task-per-process agent is replaced by a fresh one."
   (genie-rpc--ensure rpc)
-  (genie-rpc--send rpc (funcall (genie-rpc--spec rpc :prompt) text))
+  (funcall (genie-rpc--spec rpc :prompt) rpc text)
   (unless (genie-rpc--spec rpc :persistent)
     (setf (genie-rpc-session-spent rpc) t)))
 
 (defun genie-rpc-abort (rpc)
   "Interrupt the turn in flight on session RPC.
-When the backend has no abort input, ending the process is the abort."
+When the backend has no abort hook, ending the process is the abort."
   (when (genie-rpc-live-p rpc)
-    (if-let* ((msg (genie-rpc--spec rpc :abort)))
-        (genie-rpc--send rpc msg)
+    (if-let* ((abort (genie-rpc--spec rpc :abort)))
+        (funcall abort rpc)
       (genie-rpc-close rpc))))
 
 (defun genie-rpc-close (rpc)
-  "End the agent process of session RPC.
-Backends with a `:stop' message get a graceful exit first, with a kill
-fallback shortly after — an idle agent does not always honor stop, and
-a lingering process may hold locks (for example on a session file)."
+  "End the agent process of session RPC."
   (when (genie-rpc-live-p rpc)
-    (let ((proc (genie-rpc-session-proc rpc)))
-      (if-let* ((msg (genie-rpc--spec rpc :stop)))
-          (progn
-            (ignore-errors (genie-rpc--send rpc msg))
-            (run-at-time 3 nil (lambda ()
-                                 (when (process-live-p proc)
-                                   (delete-process proc)))))
-        (delete-process proc)))))
+    (delete-process (genie-rpc-session-proc rpc))))
 
 (defun genie-rpc-stderr (rpc &optional lines)
   "Return the last LINES (default 10) of RPC's agent stderr, or nil.
-The stderr of the agent process is collected separately from the JSONL
+The stderr of the agent process is collected separately from the wire
 stream, so a startup failure has a readable reason."
   (when-let* ((buf (and rpc (genie-rpc-session-stderr rpc))))
     (when (buffer-live-p buf)
@@ -153,13 +144,6 @@ stream, so a startup failure has a readable reason."
           (let ((tail (string-trim
                        (buffer-substring-no-properties (point) (point-max)))))
             (unless (string-empty-p tail) tail)))))))
-
-(defun genie-rpc-respond (rpc id response)
-  "Answer the interaction request ID on session RPC with RESPONSE.
-RESPONSE is a backend-specific plist; for elmee, for example,
-\(:outcome \"deny\" :value \"reason\") or (:outcome \"cancel\")."
-  (genie-rpc--send rpc (list :type "interaction_response"
-                             :id id :response response)))
 
 ;;;; Internals
 
@@ -191,6 +175,10 @@ RESPONSE is a backend-specific plist; for elmee, for example,
       (with-current-buffer errbuf (erase-buffer))
       (setf (genie-rpc-session-acc rpc) ""
             (genie-rpc-session-spent rpc) nil
+            (genie-rpc-session-next-id rpc) 0
+            (genie-rpc-session-pending rpc) nil
+            (genie-rpc-session-session-id rpc) nil
+            (genie-rpc-session-queue rpc) nil
             (genie-rpc-session-proc rpc)
             (make-process
              :name "genie-rpc" :buffer nil :noquery t :connection-type 'pipe
@@ -199,7 +187,9 @@ RESPONSE is a backend-specific plist; for elmee, for example,
                                         :buffer errbuf :noquery t
                                         :sentinel #'ignore)
              :filter (lambda (_proc string) (genie-rpc--filter rpc string))
-             :sentinel (lambda (proc _event) (genie-rpc--sentinel rpc proc)))))))
+             :sentinel (lambda (proc _event) (genie-rpc--sentinel rpc proc))))
+      (when-let* ((hello (genie-rpc--spec rpc :hello)))
+        (funcall hello rpc)))))
 
 (defun genie-rpc--send (rpc msg)
   "Send plist MSG to session RPC as one JSON line."
@@ -214,11 +204,11 @@ RESPONSE is a backend-specific plist; for elmee, for example,
     (setf (genie-rpc-session-acc rpc) (car (last lines)))
     (dolist (line (butlast lines))
       (unless (string-empty-p (string-trim line))
-        (when-let* ((event (ignore-errors
-                             (json-parse-string line :object-type 'plist
-                                                :null-object nil
-                                                :false-object nil))))
-          (funcall (genie-rpc--spec rpc :dispatch) rpc event))))))
+        (when-let* ((message (ignore-errors
+                               (json-parse-string line :object-type 'plist
+                                                  :null-object nil
+                                                  :false-object nil))))
+          (funcall (genie-rpc--spec rpc :dispatch) rpc message))))))
 
 (defun genie-rpc--sentinel (rpc proc)
   "Fire the `:on-exit' handler of session RPC when PROC has died."
@@ -226,11 +216,113 @@ RESPONSE is a backend-specific plist; for elmee, for example,
              (eq proc (genie-rpc-session-proc rpc)))
     (genie-rpc--fire rpc :on-exit)))
 
-;;;; Backend: Pi
+;;;; Backend: elmee over the Agent Client Protocol (JSON-RPC 2.0, ndjson)
 
-(defun genie-rpc--pi-prompt (text)
-  "Pi's prompt message carrying TEXT."
-  (list :type "prompt" :message text))
+(defun genie-rpc--request (rpc method params handler)
+  "Send JSON-RPC METHOD with PARAMS on session RPC.
+HANDLER is called with (RESULT ERROR) when the agent answers."
+  (let ((id (cl-incf (genie-rpc-session-next-id rpc))))
+    (push (cons id handler) (genie-rpc-session-pending rpc))
+    (genie-rpc--send rpc (append (list :jsonrpc "2.0" :id id :method method)
+                                 (and params (list :params params))))))
+
+(defun genie-rpc--acp-hello (rpc)
+  "ACP handshake on session RPC: initialize, then open a session.
+Prompts sent before the session is ready wait in the queue."
+  (genie-rpc--request
+   rpc "initialize" '(:protocolVersion 1)
+   (lambda (_result err)
+     (if err
+         (genie-rpc--fire rpc :on-fail
+                          (or (plist-get err :message) "initialize refused"))
+       (genie-rpc--request
+        rpc "session/new"
+        (list :cwd (directory-file-name
+                    (expand-file-name (genie-rpc-session-directory rpc))))
+        (lambda (result err)
+          (if err
+              (genie-rpc--fire rpc :on-fail
+                               (or (plist-get err :message)
+                                   "session/new refused"))
+            (setf (genie-rpc-session-session-id rpc)
+                  (plist-get result :sessionId))
+            (let ((queued (genie-rpc-session-queue rpc)))
+              (setf (genie-rpc-session-queue rpc) nil)
+              (dolist (text queued)
+                (genie-rpc--acp-send-prompt rpc text))))))))))
+
+(defun genie-rpc--acp-prompt (rpc text)
+  "Send TEXT on session RPC, queueing it until the ACP session is open."
+  (if (genie-rpc-session-session-id rpc)
+      (genie-rpc--acp-send-prompt rpc text)
+    (setf (genie-rpc-session-queue rpc)
+          (append (genie-rpc-session-queue rpc) (list text)))))
+
+(defun genie-rpc--acp-send-prompt (rpc text)
+  "Send the `session/prompt' request carrying TEXT on session RPC.
+The response ends the turn: any stop reason fires `:on-done' (streamed
+text already arrived as updates), a refusal fires `:on-fail'."
+  (genie-rpc--request
+   rpc "session/prompt"
+   (list :sessionId (genie-rpc-session-session-id rpc)
+         :prompt (vector (list :type "text" :text text)))
+   (lambda (_result err)
+     (if err
+         (genie-rpc--fire rpc :on-fail
+                          (or (plist-get err :message) "prompt refused"))
+       (genie-rpc--fire rpc :on-done nil)))))
+
+(defun genie-rpc--acp-abort (rpc)
+  "Cancel the ACP turn in flight on session RPC.
+The pending `session/prompt' then answers with a cancelled stop reason."
+  (when-let* ((session (genie-rpc-session-session-id rpc)))
+    (genie-rpc--send rpc (list :jsonrpc "2.0" :method "session/cancel"
+                               :params (list :sessionId session)))))
+
+(defun genie-rpc--acp-update (rpc update)
+  "Translate one `session/update' UPDATE plist into handler callbacks on RPC."
+  (pcase (plist-get update :sessionUpdate)
+    ("agent_message_chunk"
+     (genie-rpc--fire rpc :on-text
+                      (or (plist-get (plist-get update :content) :text) "")))
+    ("tool_call"
+     (genie-rpc--fire rpc :on-tool
+                      (or (plist-get update :title)
+                          (plist-get update :kind) "tool")))))
+
+(defun genie-rpc--acp-dispatch (rpc message)
+  "Dispatch one JSON-RPC MESSAGE from the ACP agent on session RPC.
+Responses settle our pending requests; `session/update' notifications
+stream the turn; requests from the agent are declined minimally, since
+this client advertises no capabilities they could rely on."
+  (let ((id (plist-get message :id))
+        (method (plist-get message :method)))
+    (cond
+     ((and id (not method))             ; an answer to something we asked
+      (when-let* ((cell (assq id (genie-rpc-session-pending rpc))))
+        (setf (genie-rpc-session-pending rpc)
+              (delq cell (genie-rpc-session-pending rpc)))
+        (funcall (cdr cell)
+                 (plist-get message :result) (plist-get message :error))))
+     ((equal method "session/update")
+      (genie-rpc--acp-update
+       rpc (plist-get (plist-get message :params) :update)))
+     ((and id method)                   ; a request from the agent
+      (genie-rpc--send
+       rpc (if (equal method "elicitation/create")
+               (list :jsonrpc "2.0" :id id :result '(:action "cancel"))
+             (list :jsonrpc "2.0" :id id
+                   :error '(:code -32601 :message "not supported"))))))))
+
+;;;; Backend: Pi (line-delimited JSON of Pi's own)
+
+(defun genie-rpc--pi-prompt (rpc text)
+  "Send TEXT as Pi's prompt message on session RPC."
+  (genie-rpc--send rpc (list :type "prompt" :message text)))
+
+(defun genie-rpc--pi-abort (rpc)
+  "Send Pi's abort message on session RPC."
+  (genie-rpc--send rpc '(:type "abort")))
 
 (defun genie-rpc--pi-dispatch (rpc event)
   "Translate one Pi EVENT plist into handler callbacks on session RPC."
@@ -243,32 +335,6 @@ RESPONSE is a backend-specific plist; for elmee, for example,
      (genie-rpc--fire rpc :on-tool (or (plist-get event :toolName) "tool")))
     ("agent_end"
      (genie-rpc--fire rpc :on-done nil))))
-
-;;;; Backend: elmee
-
-(defun genie-rpc--elmee-prompt (text)
-  "Elmee's prompt message carrying TEXT."
-  (list :type "prompt" :text text))
-
-(defun genie-rpc--elmee-dispatch (rpc event)
-  "Translate one elmee EVENT plist into handler callbacks on session RPC."
-  (pcase (plist-get event :type)
-    ("text"
-     (genie-rpc--fire rpc :on-text (or (plist-get event :text) "")))
-    ("tool_start"
-     (genie-rpc--fire rpc :on-tool (or (plist-get event :name) "tool")))
-    ("result"
-     (genie-rpc-close rpc)              ; one task per process
-     (genie-rpc--fire rpc :on-done (plist-get event :answer)))
-    ((or "error" "paused")
-     (genie-rpc--fire rpc :on-fail
-                      (or (plist-get event :message) "agent error")))
-    ("interaction_request"
-     (let ((request (plist-get event :request)))
-       (if (plist-get (genie-rpc-session-handlers rpc) :on-request)
-           (genie-rpc--fire rpc :on-request request)
-         (genie-rpc-respond rpc (plist-get request :id)
-                            '(:outcome "cancel")))))))
 
 (provide 'genie-rpc)
 ;;; genie-rpc.el ends here

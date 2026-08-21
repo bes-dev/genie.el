@@ -82,13 +82,14 @@ Or clone and `(add-to-list 'load-path "…/genie.el") (require 'genie)`.
 
 You also need one of the agent backends on `PATH`:
 
-- **[Pi](https://github.com/badlogic/pi-mono)** (default) — one persistent
-  `pi --mode rpc` process holds the conversation. Pin a model with
-  `genie-pi-model`, e.g. `'("--model" "qwen/qwen3.6-27b")` for a local one.
-- **[elmee](https://github.com/bes-dev/elmee)** — a fast agent microkernel in
-  Rust; one `elmee --rpc` process per wish, context carried across respawns
-  via a shared `--session` file. Select with `(setq genie-backend 'elmee)`,
-  pass a model via `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`.
+- **[elmee](https://github.com/bes-dev/elmee)** (default) — a fast agent
+  microkernel in Rust, driven over the standard
+  [Agent Client Protocol](https://agentclientprotocol.com) (`elmee --acp`):
+  one warm JSON-RPC server process holds the session. Pass a model via
+  `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`.
+- **[Pi](https://github.com/badlogic/pi-mono)** — one persistent
+  `pi --mode rpc` process speaking Pi's own line-delimited JSON. Select with
+  `(setq genie-backend 'pi)`; pin a model with `genie-pi-model`.
 
 ## Starting from nothing
 
@@ -229,24 +230,25 @@ against the same restore point.
 ## genie-rpc: the generic layer
 
 All agent plumbing lives in **`genie-rpc.el`**, an application-agnostic
-library you can reuse for any AI-based Emacs package: async duplex JSONL over
-stdio, line framing, lifecycle management (persistent process vs one process
-per task), and normalization of each backend's event stream into plain
-callbacks:
+library you can reuse for any AI-based Emacs package: async stdio transport
+with line framing, an [ACP](https://agentclientprotocol.com) client
+(JSON-RPC 2.0 with request correlation, the initialize/session handshake and
+a prompt queue until the session is open), agent stderr capture, and
+normalization of each backend's wire protocol into plain callbacks:
 
 ```elisp
-(setq rpc (genie-rpc-open 'pi (list "pi" "--mode" "rpc")
+(setq rpc (genie-rpc-open 'elmee (list "elmee" "--acp")
                           :directory "~/project/"
                           :on-text  (lambda (delta)  …)
-                          :on-tool  (lambda (name)   …)
+                          :on-tool  (lambda (label)  …)
                           :on-done  (lambda (answer) …)
                           :on-fail  (lambda (msg)    …)))
 (genie-rpc-prompt rpc "Refactor foo.el")
 ```
 
-Adding a backend is one entry in `genie-rpc-backends` — a prompt encoder, an
-event dispatcher and two lifecycle keywords. Nothing in `genie.el` knows any
-agent's JSON.
+Adding a backend is one entry in `genie-rpc-backends` — a prompt sender, a
+dispatcher and optional handshake/abort hooks. Nothing in `genie.el` knows
+any agent's JSON.
 
 ## Development
 
