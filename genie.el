@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.8.1
+;; Version: 0.9.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -40,8 +40,10 @@
 ;; `genie-spell-risky-functions') needs explicit confirmation first.
 ;;
 ;; `genie-undo' undoes the most recent genie-made change, whatever its
-;; kind: an applied wish (git revert + reload) or the buffer effect of a
-;; spell, register cast or cantrip.  `genie-journal' previews the stack.
+;; kind: an applied wish (confirmed, then dropped from history and
+;; re-loaded, so the log keeps no commit/revert pairs) or the buffer
+;; effect of a spell, register cast or cantrip.  `genie-journal'
+;; previews the stack.
 ;;
 ;; Everything is async, built on the genie-rpc library, with two agent
 ;; backends (`genie-backend'): the elmee agent microkernel by default,
@@ -820,9 +822,11 @@ the effect is already gone, which is reported instead of erroring."
 effect is already gone; C-/ if not" name (buffer-name)))))))))
 
 (defun genie--undo-wish (subject)
-  "Revert the newest genie commit; SUBJECT, when given, must match HEAD.
-Without SUBJECT (the empty-journal fallback) the revert is confirmed
-first — undoing \"the last thing\" must never surprise-revert a commit."
+  "Drop the newest genie commit entirely; SUBJECT, when given, must match HEAD.
+Always confirmed first: the commit is deleted from history (a clean log
+beats a commit/revert pair), its changes leave the worktree, and
+unrelated uncommitted work is untouched.  Note that a config pushed to
+a remote would need a force-push afterwards."
   (let ((head (genie--git "log" "-1" "--format=%s")))
     (unless (string-prefix-p "genie: " head)
       (if subject
@@ -831,27 +835,54 @@ first — undoing \"the last thing\" must never surprise-revert a commit."
 and HEAD is not a genie commit")))
     (when (and subject (not (equal subject head)))
       (user-error "Genie: HEAD moved since that wish (now at: %s)" head))
-    (unless (or subject
-                (y-or-n-p (format "No genie change journaled this session — revert \"%s\"? "
-                                  head)))
-      (user-error "Genie: not reverted"))
-    (let ((files (split-string (genie--git "diff" "--name-only" "HEAD~" "HEAD")
-                               "\n" t)))
-      (genie--git "revert" "--no-edit" "HEAD")
-      (message "🧞 reverted: %s (definitions it added stay loaded until restart)"
+    (let ((added nil) (kept nil))
+      (dolist (entry (mapcar (lambda (line) (split-string line "\t"))
+                             (split-string (genie--git "diff" "--name-status"
+                                                       "HEAD~" "HEAD")
+                                           "\n" t)))
+        (pcase (substring (car entry) 0 1)
+          ("A" (push (cadr entry) added))
+          ((or "R" "C")                 ; renamed/copied: NEW path goes away
+           (push (car (last entry)) added)
+           (when (equal (substring (car entry) 0 1) "R")
+             (push (cadr entry) kept)))
+          (_ (push (cadr entry) kept))))
+      ;; Edits made to the wish's OWN files after it was applied would be
+      ;; discarded along with it; say so before touching anything.  Work on
+      ;; other files is never in the way and is not worth mentioning.
+      (let ((overlap (cl-intersection
+                      (split-string (genie--git "diff" "--name-only" "HEAD")
+                                    "\n" t)
+                      (append added kept) :test #'equal)))
+        (unless (y-or-n-p
+                 (format "%s%sUndo \"%s\" — delete the commit entirely? "
+                         (if subject ""
+                           "No genie change journaled this session.  ")
+                         (if overlap
+                             (format "Your later edits to %s go too.  "
+                                     (string-join overlap ", "))
+                           "")
+                         head))
+          (user-error "Genie: not undone")))
+      (genie--git "reset" "-q" "--mixed" "HEAD~")
+      (when kept (apply #'genie--git "checkout" "HEAD" "--" kept))
+      (dolist (file added)
+        (ignore-errors (delete-file (expand-file-name file (genie--root)))))
+      (message "🧞 dropped: %s (definitions it added stay loaded until restart)"
                head)
       (genie--reload
        (cl-remove-if-not
         (lambda (f) (file-exists-p (expand-file-name f (genie--root))))
-        files)))))
+        kept)))))
 
 ;;;###autoload
 (defun genie-undo ()
   "Undo the most recent genie-made change, whatever its kind.
-An applied wish is reverted with `git revert' and its files re-reloaded;
-the buffer effect of a spell, register cast or cantrip is undone in the
+An applied wish is, after confirmation, deleted from history entirely
+\(no commit/revert pairs in the log) and its files re-reloaded; the
+buffer effect of a spell, register cast or cantrip is undone in the
 buffer it edited.  When the session journal is empty (a fresh Emacs),
-offers to revert HEAD if it is a genie commit.  `genie-journal' previews
+offers to drop HEAD if it is a genie commit.  `genie-journal' previews
 the stack."
   (interactive)
   (unless (eq genie--state 'idle)

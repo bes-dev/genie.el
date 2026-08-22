@@ -28,7 +28,8 @@ commit "genie: <wish>"            worktree restored
 (offers restart when init.el changed)
 ```
 
-`M-x genie-undo` reverts the last applied wish — every wish is one git commit.
+`M-x genie-undo` undoes the last applied wish — every wish is one git commit,
+and undoing one deletes it from history rather than piling a revert on top.
 
 **Spells** are the ephemeral counterpart: `M-x genie-spell` *"number the lines
 of the selected region"* generates an interactive command, evaluates it
@@ -49,8 +50,8 @@ there is one. The command stays armed afterwards, so a cantrip that earned
 its keep can be re-cast, slotted into a register, or promoted to the config.
 
 **One undo for everything**: `genie-undo` pops the most recent genie-made
-change from a session journal, whatever it was — an applied wish (reverted
-via `git revert` and re-reloaded) or the buffer effect of a spell, register
+change from a session journal, whatever it was — an applied wish (confirmed,
+then dropped from history and re-reloaded) or the buffer effect of a spell, register
 cast or cantrip (undone precisely in the buffer it edited, even if you've
 moved elsewhere since).
 
@@ -111,7 +112,7 @@ and nothing else. Everything it will ever have arrives as a wish.
 (global-set-key (kbd "C-c g g") #'genie)         ; state a wish
 (global-set-key (kbd "C-c g c") #'genie-chat)    ; multi-turn chat
 (global-set-key (kbd "C-c g d") #'genie-diff)    ; review the pending diff
-(global-set-key (kbd "C-c g u") #'genie-undo)    ; revert the last wish
+(global-set-key (kbd "C-c g u") #'genie-undo)    ; undo the last wish
 (global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
 (global-set-key (kbd "C-c g s") #'genie-spell)   ; conjure an ephemeral command
 (global-set-key (kbd "C-c g x") #'genie-cast)    ; cast the current spell
@@ -170,7 +171,10 @@ an empty `init.el` with nothing but genie in it:
   explicit confirmation. `'parens` checks bracket balance only; `nil` skips.
 - **Nothing applies silently** — you read the diff (`diff-mode`, hunk
   navigation included) unless you opt into `genie-auto-apply`.
-- **One wish, one commit** — `genie-undo` is a plain `git revert`.
+- **One wish, one commit** — and `genie-undo` deletes that commit outright
+  (after confirmation) instead of leaving a commit/revert pair in the log;
+  later edits of your own to the same files are named in the prompt first.
+  A config with a remote needs a force-push after an undo.
 - **Scoped agent** — the system prompt confines edits to `genie-config-root`;
   interactive approval requests from the agent are denied by policy.
 - **Spells never touch disk** — a generated `defun` only defines a command;
@@ -182,7 +186,7 @@ an empty `init.el` with nothing but genie in it:
   stays instant.
 - **Undo never surprises** — `genie-undo` pops a session journal of
   genie-made changes; with an empty journal (a fresh Emacs) it *offers* to
-  revert a genie commit at HEAD instead of silently doing so.
+  drop a genie commit at HEAD instead of silently doing so.
   `genie-journal` previews the stack.
 - **An explicit turn state machine** (`idle → thinking → validating →
   reviewing`) guards every entry point: you cannot apply a stale diff while

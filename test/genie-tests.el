@@ -205,7 +205,9 @@ The healed file survives in the worktree as a plain untracked file."
     (should (eq genie--state 'idle))))
 
 (ert-deftest genie-git-commit-and-undo ()
-  "Apply commits only touched files; fallback undo confirms, then reverts."
+  "Apply commits only touched files; undo confirms, then drops the commit.
+The commit leaves history entirely, its created files leave the
+worktree, and unrelated uncommitted work survives untouched."
   (genie-tests--with-repo
     (genie-tests--write "a.el" "(setq a 1)\n")
     (genie-tests--write "b.el" "(setq b 1)\n")
@@ -224,15 +226,18 @@ The healed file survives in the worktree as a plain untracked file."
                              (genie--git "log" "-1" "--format=%s")))
     (should (member "b.el" (split-string
                             (genie--git "diff" "--name-only" "HEAD") "\n" t)))
-    ;; the empty-journal fallback asks first; declining leaves HEAD alone
+    ;; undo asks first; declining leaves the commit alone
     (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) nil)))
       (should-error (genie-undo) :type 'user-error))
+    (should (string-prefix-p "genie: " (genie--git "log" "-1" "--format=%s")))
     (cl-letf (((symbol-function 'genie--reload) #'ignore)
               ((symbol-function 'y-or-n-p) (lambda (_) t)))
       (genie-undo))
     (should (equal (genie-tests--read "a.el") "(setq a 1)\n"))
     (should-not (file-exists-p (expand-file-name "d.el" (genie--root))))
-    (should (equal (genie-tests--read "b.el") "(setq b 2)\n"))))
+    (should (equal (genie-tests--read "b.el") "(setq b 2)\n"))
+    ;; the commit is gone from history, not reverted on top of it
+    (should (equal (genie--git "log" "--format=%s") "base"))))
 
 (ert-deftest genie-reload-covers-init-el ()
   "Reload evaluates changed modules first, then init.el itself."
@@ -255,6 +260,32 @@ The healed file survives in the worktree as a plain untracked file."
                  (lambda (prompt) (setq asked prompt) nil)))
         (genie--reload '("boom.el")))
       (should (string-match-p "boom\\.el" asked)))))
+
+(ert-deftest genie-undo-warns-only-about-overlapping-edits ()
+  "The drop prompt names later edits to the wish's files, and only those."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie-tests--write "b.el" "(setq b 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (genie-tests--write "a.el" "(setq a 5)\n")
+    (genie--git "commit" "-qm" "genie: five" "--" "a.el")
+    ;; unrelated WIP must not be mentioned…
+    (genie-tests--write "b.el" "(setq b 99)\n")
+    (let (prompt)
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (p) (setq prompt p) nil)))
+        (should-error (genie--undo-wish nil) :type 'user-error))
+      (should-not (string-match-p "b\\.el" prompt))
+      ;; …but a later edit to the wish's own file must be
+      (genie-tests--write "a.el" "(setq a 7)\n")
+      (cl-letf (((symbol-function 'y-or-n-p)
+                 (lambda (p) (setq prompt p) nil)))
+        (should-error (genie--undo-wish nil) :type 'user-error))
+      (should (string-match-p "a\\.el" prompt)))
+    ;; declining changed nothing
+    (should (equal (genie-tests--read "b.el") "(setq b 99)\n"))
+    (should (string-prefix-p "genie: " (genie--git "log" "-1" "--format=%s")))))
 
 (ert-deftest genie-undo-refuses-foreign-head ()
   "Undo refuses when HEAD is not a genie commit."

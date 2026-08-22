@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.9.0] — 2026-08-22
+
+- Undoing a wish now **deletes its commit** instead of reverting it: the
+  log keeps one entry per wish and no commit/revert pairs, which is what
+  makes `git log` readable as the config's biography. The drop is always
+  confirmed first, and the prompt names any later edits of your own to
+  the wish's files, since those would go with it. Unrelated uncommitted
+  work is never touched. A config pushed to a remote needs a force-push
+  after an undo.
+
 ## [0.8.1] — 2026-08-22
 
 - The activity animation is now breathing dots — thinking. thinking..
