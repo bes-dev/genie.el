@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.8.0
+;; Version: 0.8.1
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -189,23 +189,21 @@ where PRE and POST are its `buffer-undo-list' before and after.")
 
 ;;;; The state machine
 
-(defconst genie--spinner-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
-  "Frames of the activity spinner.")
-(defvar genie--spinner-index 0 "Current frame of the activity spinner.")
-(defvar genie--spinner-timer nil "Timer animating the spinner while genie works.")
+(defvar genie--spinner-index 0 "Current frame of the activity animation.")
+(defvar genie--spinner-timer nil "Timer animating the mode line while genie works.")
 
 (defun genie--activity (&optional verbose)
-  "Return the spinning activity string for mode lines, or nil when quiet.
-Deliberately terse — just the spinner and a word; the play-by-play of
-tool calls goes to the transcript buffer instead.  With VERBOSE,
-thinking also names the abort key of the chat buffer."
-  (let ((spin (aref genie--spinner-frames
-                    (mod genie--spinner-index
-                         (length genie--spinner-frames)))))
+  "Return the animated activity string for mode lines, or nil when quiet.
+The animation is one to three trailing dots after the word, kept
+deliberately ASCII: fancier spinner glyphs render as identical boxes
+under fonts that lack them, which looks frozen.  The dots are padded so
+the mode line does not jitter.  With VERBOSE, thinking also names the
+abort key of the chat buffer."
+  (let ((dots (format "%-3s" (make-string (1+ (mod genie--spinner-index 3)) ?.))))
     (pcase genie--state
-      ('thinking (format "🧞%s %s" spin
-                         (if verbose "thinking… (C-c C-k abort)" "thinking…")))
-      ('validating (format "🧞%s validating…" spin))
+      ('thinking (format "🧞 thinking%s%s" dots
+                         (if verbose " (C-c C-k abort)" "")))
+      ('validating (format "🧞 validating%s" dots))
       (_ nil))))
 
 (defun genie--mode-line-string ()
@@ -238,7 +236,7 @@ values left bound by an older genie in a hot-reloaded session.")
          (unless genie--spinner-timer
            (setq genie--spinner-index 0
                  genie--spinner-timer
-                 (run-at-time 0 0.12 #'genie--spinner-tick))))
+                 (run-at-time 0 0.4 #'genie--spinner-tick))))
         (genie--spinner-timer
          (cancel-timer genie--spinner-timer)
          (setq genie--spinner-timer nil)))

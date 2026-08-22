@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.8.1] — 2026-08-22
+
+- The activity animation is now breathing dots — thinking. thinking..
+  thinking... — instead of braille spinner glyphs, which render as
+  identical boxes under fonts that lack them and therefore look frozen.
+  Dots are padded so the mode line does not jitter; the tick slows to a
+  calmer 0.4s. Mechanics double-checked against spinner.el — the timer
+  discipline was already equivalent; the glyphs were the problem.
+
 ## [0.8.0] — 2026-08-22
 
 - Tool activity moved out of the echo area: each tool call is now a

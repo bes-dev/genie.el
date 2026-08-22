@@ -311,10 +311,17 @@ The healed file survives in the worktree as a plain untracked file."
         (progn
           (genie--set-state 'thinking)
           (should (timerp genie--spinner-timer))
-          (should (string-match-p "thinking…" (genie--activity)))
+          (should (string-match-p "thinking\\." (genie--activity)))
+          ;; the dots breathe: one, two, three, then one again
+          (should (equal (mapcar (lambda (i)
+                                   (let ((genie--spinner-index i))
+                                     (genie--activity)))
+                                 '(0 1 2 3))
+                         '("🧞 thinking.  " "🧞 thinking.. "
+                           "🧞 thinking..." "🧞 thinking.  ")))
           (genie--set-state 'validating)
           (should (timerp genie--spinner-timer))
-          (should (string-match-p "validating…" (genie--activity)))
+          (should (string-match-p "validating\\." (genie--activity)))
           (genie--set-state 'idle)
           (should-not genie--spinner-timer)
           (should-not (genie--activity)))
