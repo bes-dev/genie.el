@@ -3,6 +3,26 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.10.0] — 2026-08-25
+
+Ceremony became a setting, and the recommended config has none.
+
+- New `genie-confirm` names the actions that stop to ask you: `wish`
+  (review the diff), `risky-spell` (approve conjured code reaching for
+  the shell, network or file deletion), `undo` (approve dropping a
+  commit). The README and `bootstrap.sh` configs now set
+  `'(risky-spell)`: a wish is validated, committed and hot-reloaded on
+  the spot, and you judge it in the running editor. `genie-auto-apply`
+  is obsolete but still honored.
+- Nothing is lost by the frictionless flow: a change that fails
+  validation is still shown for review rather than applied, every wish
+  is still one commit, and `genie-undo` still takes it back. Dropping a
+  commit still asks whenever later edits of your own would go with it,
+  whatever the setting says.
+- Instant wishes are quiet: no window is stolen on success — just one
+  line naming the wish, the files and the undo key. Risky conjured code
+  is still named in the echo area even when the gate is off.
+
 ## [0.9.0] — 2026-08-22
 
 - Undoing a wish now **deletes its commit** instead of reverting it: the

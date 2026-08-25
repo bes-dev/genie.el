@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.9.0
+;; Version: 0.10.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -28,7 +28,8 @@
 ;; Rub the lamp (`M-x genie'), state a wish, and an AI agent edits your
 ;; Emacs configuration.  The change is validated (a batch subprocess must
 ;; load init.el cleanly), reviewed as a git diff, committed as
-;; "genie: <wish>" and hot-reloaded on accept — or restored on reject.
+;; "genie: <wish>" and hot-reloaded — on the spot, or after a diff review
+;; you can reject, depending on `genie-confirm'.
 ;;
 ;; Spells are the ephemeral counterpart: `genie-spell' conjures an
 ;; interactive command from a request, evaluates it straight into the
@@ -37,7 +38,8 @@
 ;; and executes it immediately where it was asked from; `genie-spell-keep'
 ;; turns the current spell into a permanent wish.  Conjured code that
 ;; calls anything risky (processes, network, file deletion — see
-;; `genie-spell-risky-functions') needs explicit confirmation first.
+;; `genie-spell-risky-functions') is screened before it is evaluated,
+;; and named in the echo area even when `genie-confirm' asks nothing.
 ;;
 ;; `genie-undo' undoes the most recent genie-made change, whatever its
 ;; kind: an applied wish (confirmed, then dropped from history and
@@ -54,6 +56,7 @@
 ;;
 ;;   (require 'genie)
 ;;   (setq genie-config-root "~/.emacs.d/")   ; must be a git repository
+;;   (setq genie-confirm '(risky-spell))      ; frictionless: apply on the spot
 ;;   ;; recommended bindings:
 ;;   (global-set-key (kbd "C-c g g") #'genie)
 ;;   (global-set-key (kbd "C-c g c") #'genie-chat)
@@ -124,9 +127,34 @@ A wish that adds packages makes the validation install them, which can
 be slow on the first run — raise this when that bites."
   :type 'integer :group 'genie)
 
+(defcustom genie-confirm '(wish risky-spell undo)
+  "Which genie actions stop to ask you first.
+
+  `wish'         review the diff before an applied wish is committed
+  `risky-spell'  approve conjured code that calls a risky function
+                 \(see `genie-spell-risky-functions')
+  `undo'         approve deleting a wish's commit from history
+
+Drop `wish' for the frictionless flow the README recommends: a wish is
+validated, committed and hot-reloaded on the spot, and you judge the
+result in the running editor instead of in a diff.  Nothing is lost by
+it — every wish is still one commit that `genie-undo' takes back — and
+a wish that fails validation is still shown for review rather than
+applied.  Set to nil to never be asked anything."
+  :type '(set (const :tag "Review the diff of a wish" wish)
+              (const :tag "Approve risky conjured code" risky-spell)
+              (const :tag "Approve dropping a commit" undo))
+  :group 'genie)
+
 (defcustom genie-auto-apply nil
-  "When non-nil, commit and reload without the diff review if validation passes."
+  "Obsolete; non-nil is the same as dropping `wish' from `genie-confirm'."
   :type 'boolean :group 'genie)
+(make-obsolete-variable 'genie-auto-apply 'genie-confirm "0.10.0")
+
+(defun genie--confirm-p (what)
+  "Return non-nil when WHAT is an action the user wants to confirm."
+  (and (memq what genie-confirm)
+       (not (and (eq what 'wish) genie-auto-apply))))
 
 (defcustom genie-manual-file "GENIE.md"
   "The config's user manual, relative to `genie-config-root'.
@@ -559,8 +587,11 @@ events cannot re-run the pipeline."
      ((null genie--changed)
       (setq genie--verdict nil)
       (genie--set-state 'idle)
-      (display-buffer (genie--buffer))
-      (message "🧞 done — no config changes"))
+      ;; Quiet when the user asked for a frictionless flow: the answer is
+      ;; in the transcript for whoever wants it, without stealing a window.
+      (if (genie--confirm-p 'wish)
+          (display-buffer (genie--buffer))
+        (message "🧞 done — no config changes (C-c g c to read the answer)")))
      (t
       (genie--set-state 'validating)
       (message "🧞 validating %d file(s)…" (length genie--changed))
@@ -569,7 +600,9 @@ events cannot re-run the pipeline."
          (when (eq genie--state 'validating) ; ignore a stale callback
            (setq genie--verdict verdict)
            (genie--set-state 'reviewing)
-           (if (and genie-auto-apply (car verdict))
+           ;; A change that fails validation is always shown, however
+           ;; frictionless the flow: that is the guarantee worth keeping.
+           (if (and (car verdict) (not (genie--confirm-p 'wish)))
                (genie-apply)
              (genie--show-diff)))))))))
 
@@ -741,14 +774,22 @@ load falls back to offering a full restart."
          "--" genie--changed)
   (push (cons 'wish (car (split-string (format "genie: %s" genie--wish) "\n")))
         genie--journal)
-  (let ((files genie--changed))
+  (let ((files genie--changed)
+        (wish genie--wish))
     (genie--reset)
     (genie--quit-diff)
     (genie--set-state 'idle)
     (message "🧞 wish applied and committed")
     (genie--reload files)
-    ;; The agent's report documents what was added and how to use it.
-    (display-buffer (genie--buffer))))
+    (if (genie--confirm-p 'wish)
+        ;; The agent's report documents what was added and how to use it.
+        (display-buffer (genie--buffer))
+      ;; In the frictionless flow the change is already live and the user is
+      ;; looking at the editor, not at us: one line saying what happened and
+      ;; how to take it back beats a window they did not ask for.
+      (message "🧞 %s · %s · C-c g u undoes it"
+               (truncate-string-to-width wish 60 nil nil "…")
+               (string-join files " · ")))))
 
 (defun genie-reject ()
   "Discard the pending wish: restore every touched file to its pre-wish state."
@@ -854,16 +895,19 @@ and HEAD is not a genie commit")))
                       (split-string (genie--git "diff" "--name-only" "HEAD")
                                     "\n" t)
                       (append added kept) :test #'equal)))
-        (unless (y-or-n-p
-                 (format "%s%sUndo \"%s\" — delete the commit entirely? "
-                         (if subject ""
-                           "No genie change journaled this session.  ")
-                         (if overlap
-                             (format "Your later edits to %s go too.  "
-                                     (string-join overlap ", "))
-                           "")
-                         head))
-          (user-error "Genie: not undone")))
+        ;; Asked when `genie-confirm' says so — and always when work of the
+        ;; user's own would go with the commit, whatever the setting.
+        (when (or overlap (genie--confirm-p 'undo))
+          (unless (y-or-n-p
+                   (format "%s%sUndo \"%s\" — delete the commit entirely? "
+                           (if subject ""
+                             "No genie change journaled this session.  ")
+                           (if overlap
+                               (format "Your later edits to %s go too.  "
+                                       (string-join overlap ", "))
+                             "")
+                           head))
+            (user-error "Genie: not undone"))))
       (genie--git "reset" "-q" "--mixed" "HEAD~")
       (when kept (apply #'genie--git "checkout" "HEAD" "--" kept))
       (dolist (file added)
@@ -989,13 +1033,19 @@ anything is evaluated.  With CAST-NOW (a cantrip), immediately invoke
 the command where it was asked from."
   (condition-case err
       (let* ((code (string-trim (genie--extract-elisp answer)))
-             (risky (genie--risky-calls code)))
+             (risky (genie--risky-calls code))
+             (named (and risky (mapconcat #'symbol-name risky ", "))))
         (when risky
-          (display-buffer (genie--buffer))
-          (unless (yes-or-no-p (format "⚠ The conjured code calls %s — allow? "
-                                       (mapconcat #'symbol-name risky ", ")))
-            (error "Spell discarded — its code is in the %s buffer"
-                   genie-buffer)))
+          (if (genie--confirm-p 'risky-spell)
+              (progn
+                (display-buffer (genie--buffer))
+                (unless (yes-or-no-p
+                         (format "⚠ The conjured code calls %s — allow? " named))
+                  (error "Spell discarded — its code is in the %s buffer"
+                         genie-buffer)))
+            ;; Without the gate the call is still named — a spell reaching
+            ;; for the shell is worth knowing about even when nobody is asked.
+            (message "⚠ conjured code calls %s" named)))
         (let* ((fn (genie--eval-spell code))
                (entry (list fn (symbol-function fn) code)))
           (push entry genie--spells)

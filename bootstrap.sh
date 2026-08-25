@@ -44,6 +44,10 @@ cat > "$EMACS_D/init.el" <<'EOF'
   (package-vc-install "https://github.com/bes-dev/genie.el"))
 (require 'genie)
 
+;; Wishes apply as soon as they validate — judge them in the editor,
+;; take them back with C-c g u.  See `genie-confirm' for the ceremonies.
+(setq genie-confirm '(risky-spell))
+
 ;; The lamp's controls.
 (global-set-key (kbd "C-c g g") #'genie)         ; state a wish
 (global-set-key (kbd "C-c g c") #'genie-chat)    ; multi-turn chat

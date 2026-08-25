@@ -20,13 +20,22 @@ async RPC agent edits your config files (Pi or elmee backend)
 validation — a batch subprocess must load init.el cleanly
    │
    ▼
+commit "genie: <wish>" + hot-reload of the changed files
+```
+
+That last step is instant by default in the recommended config: you see the
+change in the running editor rather than in a diff. Prefer to look first?
+Keep `wish` in `genie-confirm` and every change stops at a review instead:
+
+```
 git diff review:  [a] apply   [r] reject   [q] quit
    │ a                                │ r
    ▼                                  ▼
-commit "genie: <wish>"            worktree restored
-+ hot-reload of changed files     to the pre-wish state
-(offers restart when init.el changed)
+commit + hot-reload               worktree restored to the pre-wish state
 ```
+
+Either way a change that **fails validation** is always shown for review,
+never applied silently.
 
 `M-x genie-undo` undoes the last applied wish — every wish is one git commit,
 and undoing one deletes it from history rather than piling a revert on top.
@@ -67,6 +76,10 @@ Not on MELPA yet. With `straight.el`:
 (use-package genie
   :straight (genie :type git :host github :repo "bes-dev/genie.el")
   :custom (genie-config-root "~/.emacs.d/")   ; must be a git repository
+          ;; Frictionless: a wish is validated, committed and hot-reloaded on
+          ;; the spot; you judge it in the running editor and C-c g u takes it
+          ;; back. Keep the one screen that guards generated code.
+          (genie-confirm '(risky-spell))
   :bind (("C-c g g" . genie)
          ("C-c g c" . genie-chat)
          ("C-c g d" . genie-diff)
@@ -107,6 +120,10 @@ and nothing else. Everything it will ever have arrives as a wish.
 (unless (package-installed-p 'genie)
   (package-vc-install "https://github.com/bes-dev/genie.el"))
 (require 'genie)
+
+;; Wishes apply as soon as they validate — judge them in the editor,
+;; take them back with C-c g u. See `genie-confirm' for the ceremonies.
+(setq genie-confirm '(risky-spell))
 
 ;; The lamp's controls.
 (global-set-key (kbd "C-c g g") #'genie)         ; state a wish
@@ -169,8 +186,11 @@ an empty `init.el` with nothing but genie in it:
 - **Validation before review** — `genie-validate` is `'batch` by default: a
   throwaway `emacs --batch -l init.el` must exit cleanly, or apply demands
   explicit confirmation. `'parens` checks bracket balance only; `nil` skips.
-- **Nothing applies silently** — you read the diff (`diff-mode`, hunk
-  navigation included) unless you opt into `genie-auto-apply`.
+- **Ceremony is yours to choose** (`genie-confirm`) — review every diff
+  (`diff-mode`, hunk navigation included), or let validated wishes apply on
+  the spot and judge them in the editor. Nothing is lost by the latter: a
+  failed validation still stops for review, every wish is still one commit,
+  and `genie-undo` still takes it back.
 - **One wish, one commit** — and `genie-undo` deletes that commit outright
   (after confirmation) instead of leaving a commit/revert pair in the log;
   later edits of your own to the same files are named in the prompt first.
@@ -224,7 +244,7 @@ against the same restore point.
 | `genie-backend` | `'pi` | Agent backend: `'pi` or `'elmee` |
 | `genie-config-root` | `user-emacs-directory` | The git repo genie may edit |
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
-| `genie-auto-apply` | `nil` | Skip review when validation passes |
+| `genie-confirm` | `'(wish risky-spell undo)` | Which actions stop to ask; the README config drops `wish` |
 | `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
 | `genie-validate-timeout` | `120` | Seconds before batch validation is killed (package installs are slow) |
 | `genie-spell-risky-functions` | processes, network, deletion… | Calls a conjured spell must confirm |

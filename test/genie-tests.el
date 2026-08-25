@@ -366,6 +366,89 @@ worktree, and unrelated uncommitted work survives untouched."
                (lambda () (error "Pipeline ran twice"))))
       (genie--finish-turn))))                   ; no error means it was ignored
 
+;;;; genie: the confirmation dial
+
+(ert-deftest genie-confirm-dial ()
+  "`genie--confirm-p' reads the dial, and honors the obsolete flag."
+  (let ((genie-confirm '(wish risky-spell undo)) (genie-auto-apply nil))
+    (should (genie--confirm-p 'wish))
+    (should (genie--confirm-p 'undo)))
+  (let ((genie-confirm '(risky-spell)) (genie-auto-apply nil))
+    (should-not (genie--confirm-p 'wish))
+    (should (genie--confirm-p 'risky-spell)))
+  (let ((genie-confirm nil) (genie-auto-apply nil))
+    (should-not (genie--confirm-p 'risky-spell)))
+  ;; the obsolete boolean still switches the wish review off
+  (let ((genie-confirm '(wish)) (genie-auto-apply t))
+    (should-not (genie--confirm-p 'wish))))
+
+(ert-deftest genie-instant-wish-skips-the-review ()
+  "Without `wish' confirmation a validated change applies straight away."
+  (let ((genie-confirm nil) (genie--state 'thinking) (genie--turn 'wish)
+        (genie--changed '("a.el")) (genie--turn-baseline nil)
+        applied shown)
+    (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
+              ((symbol-function 'genie--insert-prompt) #'ignore)
+              ((symbol-function 'genie--validate)
+               (lambda (cb) (funcall cb '(t . "ok"))))
+              ((symbol-function 'genie-apply) (lambda () (setq applied t)))
+              ((symbol-function 'genie--show-diff) (lambda () (setq shown t))))
+      (genie--finish-turn))
+    (should applied)
+    (should-not shown)))
+
+(ert-deftest genie-instant-wish-still-reviews-a-failure ()
+  "A change that fails validation is reviewed however frictionless the flow."
+  (let ((genie-confirm nil) (genie--state 'thinking) (genie--turn 'wish)
+        (genie--changed '("a.el")) (genie--turn-baseline nil)
+        applied shown)
+    (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
+              ((symbol-function 'genie--insert-prompt) #'ignore)
+              ((symbol-function 'genie--validate)
+               (lambda (cb) (funcall cb '(nil . "init.el broke"))))
+              ((symbol-function 'genie-apply) (lambda () (setq applied t)))
+              ((symbol-function 'genie--show-diff) (lambda () (setq shown t))))
+      (genie--finish-turn))
+    (should shown)
+    (should-not applied)))
+
+(ert-deftest genie-instant-undo-skips-the-prompt ()
+  "Without `undo' confirmation the commit is dropped without asking…"
+  (genie-tests--with-repo
+    (let ((genie-confirm nil) asked)
+      (genie-tests--write "a.el" "(setq a 1)\n")
+      (genie--git "add" "-A")
+      (genie--git "commit" "-qm" "base")
+      (genie-tests--write "a.el" "(setq a 5)\n")
+      (genie--git "commit" "-qm" "genie: five" "--" "a.el")
+      (cl-letf (((symbol-function 'genie--reload) #'ignore)
+                ((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) t)))
+        (genie--undo-wish nil))
+      (should-not asked)
+      (should (equal (genie--git "log" "--format=%s") "base"))
+      ;; …unless the user's own later edits would go with it
+      (genie-tests--write "a.el" "(setq a 9)\n")
+      (genie--git "commit" "-qm" "genie: nine" "--" "a.el")
+      (genie-tests--write "a.el" "(setq a 10)\n")   ; later edit of your own
+      (cl-letf (((symbol-function 'genie--reload) #'ignore)
+                ((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) nil)))
+        (should-error (genie--undo-wish nil) :type 'user-error))
+      (should asked))))
+
+(ert-deftest genie-instant-risky-spell-reports-instead-of-asking ()
+  "Without the gate risky code is evaluated, but the call is still named."
+  (let ((genie-confirm nil) (genie--spell nil) (genie--spells nil)
+        (genie--pending-register nil) (genie--cantrip-target nil)
+        said)
+    (cl-letf (((symbol-function 'yes-or-no-p)
+               (lambda (_) (error "Must not ask")))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) said))))
+      (genie--learn-spell
+       "(defun genie-spell/risky () (interactive) (shell-command \"ls\"))"))
+    (should (eq (genie--spell-name genie--spell) 'genie-spell/risky))
+    (should (cl-some (lambda (s) (string-match-p "shell-command" s)) said))))
+
 ;;;; genie: maintainer charter
 
 (ert-deftest genie-charter-covers-maintainer-duties ()
