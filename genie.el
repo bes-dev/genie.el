@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.11.0
+;; Version: 0.12.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -156,16 +156,6 @@ reviewing diffs is shown one; for everyone else the change is undone and
 reported in plain words.  Zero disables repair."
   :type 'integer :group 'genie)
 
-(defcustom genie-auto-apply nil
-  "Obsolete; non-nil is the same as dropping `wish' from `genie-confirm'."
-  :type 'boolean :group 'genie)
-(make-obsolete-variable 'genie-auto-apply 'genie-confirm "0.10.0")
-
-(defun genie--confirm-p (what)
-  "Return non-nil when WHAT is an action the user wants to confirm."
-  (and (memq what genie-confirm)
-       (not (and (eq what 'wish) genie-auto-apply))))
-
 (defcustom genie-manual-file "GENIE.md"
   "The config's user manual, relative to `genie-config-root'.
 The agent keeps it updated as the config grows: a concise reference of
@@ -186,6 +176,10 @@ anything reaching processes, the network, file deletion or Emacs's
 lifetime is screened before the code is evaluated."
   :type '(repeat symbol) :group 'genie)
 
+(defun genie--confirm-p (what)
+  "Return non-nil when `genie-confirm' lists WHAT as needing approval."
+  (memq what genie-confirm))
+
 (defconst genie-buffer "*genie*"
   "Name of the transcript/chat buffer.")
 
@@ -198,21 +192,18 @@ lifetime is screened before the code is evaluated."
 New turns start from `idle' or `reviewing' (a refinement); `thinking'
 covers an agent turn in flight; `validating' the async batch check.")
 (defvar genie--tool nil "Name of the tool currently running.")
-(defvar genie--seen-text nil "Non-nil once the current turn emitted real text.")
 (defvar genie--ctxfile nil "Temp file holding Pi's system-prompt addendum.")
 (defvar genie--input-start nil "Marker where the chat input begins.")
 (defvar genie--wish nil "Wish text of the pending turn(s), used as commit message.")
 (defvar genie--wish-history nil "Minibuffer history for wishes.")
 (defvar genie--spell-history nil "Minibuffer history for spells and cantrips.")
 (defvar genie--pre nil "Commit capturing the pre-wish worktree (restore point).")
-(defvar genie--pre-dirty nil "Files already dirty before the wish.")
 (defvar genie--pre-untracked nil "Files already untracked before the wish.")
 (defvar genie--changed nil "Files changed by the pending wish.")
 (defvar genie--created nil "Files newly created by the pending wish.")
 (defvar genie--verdict nil "Validation result (OK . DETAIL), or nil when unknown.")
 (defvar genie--repairs 0 "Repair turns spent on the change under validation.")
 (defvar genie--turn 'wish "Kind of the turn in flight: `wish', `spell' or `cantrip'.")
-(defvar genie--turn-baseline nil "Value of `genie--changed' when the turn started.")
 (defvar genie--answer "" "Accumulated answer text of the turn in flight.")
 (defvar genie--spell nil "The current conjured spell entry, or nil.")
 (defvar genie--spells nil
@@ -233,54 +224,44 @@ where PRE and POST are its `buffer-undo-list' before and after.")
 (defvar genie--spinner-index 0 "Current frame of the activity animation.")
 (defvar genie--spinner-timer nil "Timer animating the mode line while genie works.")
 
-(defun genie--activity (&optional verbose)
-  "Return the animated activity string for mode lines, or nil when quiet.
+(defun genie--activity ()
+  "Return the animated activity string for the mode line, \"\" when quiet.
 The animation is one to three trailing dots after the word, kept
 deliberately ASCII: fancier spinner glyphs render as identical boxes
 under fonts that lack them, which looks frozen.  The dots are padded so
-the mode line does not jitter.  With VERBOSE, thinking also names the
-abort key of the chat buffer."
+the mode line does not jitter."
   (let ((dots (format "%-3s" (make-string (1+ (mod genie--spinner-index 3)) ?.))))
     (pcase genie--state
-      ('thinking (format "🧞 thinking%s%s" dots
-                         (if verbose " (C-c C-k abort)" "")))
-      ('validating (format "🧞 validating%s" dots))
-      (_ nil))))
+      ('thinking (format " 🧞 thinking%s" dots))
+      ('validating (format " 🧞 validating%s" dots))
+      (_ ""))))
 
-(defun genie--mode-line-string ()
-  "Return the global mode-line segment for genie activity."
-  (let ((activity (genie--activity)))
-    (if activity (concat " " activity) "")))
+;; Put straight into `global-mode-string' rather than through a variable:
+;; the form calls whatever `genie--activity' is defined right now, so a
+;; hot-reloaded genie animates without anything having to be healed.
+(defconst genie--indicator '(:eval (genie--activity))
+  "The mode-line element showing genie activity in every buffer.")
 
-(defconst genie--mode-line-construct '(:eval (genie--mode-line-string))
-  "The canonical global-indicator construct, a trampoline into a function.")
-
-(defvar genie--mode-line genie--mode-line-construct
-  "Mode-line construct showing genie activity in every buffer.
-`genie--install-indicator' re-canonicalizes this on every turn, healing
-values left bound by an older genie in a hot-reloaded session.")
-(put 'genie--mode-line 'risky-local-variable t)
-
-(defun genie--spinner-tick ()
-  "Advance the activity spinner and repaint, stopping when genie is quiet."
-  (if (memq genie--state '(thinking validating))
-      (progn (setq genie--spinner-index (1+ genie--spinner-index))
-             (force-mode-line-update t))
-    (when genie--spinner-timer
-      (cancel-timer genie--spinner-timer)
-      (setq genie--spinner-timer nil))))
+(defun genie--install-indicator ()
+  "Put the activity indicator in `global-mode-string', once."
+  (unless (listp global-mode-string)
+    (setq global-mode-string (list "" global-mode-string)))
+  (unless (member genie--indicator global-mode-string)
+    (setq global-mode-string (append global-mode-string (list genie--indicator)))))
 
 (defun genie--set-state (state)
-  "Move the turn machine to STATE, drive the spinner, refresh mode lines."
+  "Move the turn machine to STATE, and run the spinner exactly while it works."
   (setq genie--state state)
-  (cond ((memq state '(thinking validating))
-         (unless genie--spinner-timer
-           (setq genie--spinner-index 0
-                 genie--spinner-timer
-                 (run-at-time 0 0.4 #'genie--spinner-tick))))
-        (genie--spinner-timer
-         (cancel-timer genie--spinner-timer)
-         (setq genie--spinner-timer nil)))
+  (if (memq state '(thinking validating))
+      (unless genie--spinner-timer
+        (setq genie--spinner-index 0
+              genie--spinner-timer
+              (run-at-time 0 0.4 (lambda ()
+                                   (cl-incf genie--spinner-index)
+                                   (force-mode-line-update t)))))
+    (when genie--spinner-timer
+      (cancel-timer genie--spinner-timer)
+      (setq genie--spinner-timer nil)))
   (force-mode-line-update t))
 
 (defun genie--require-ready ()
@@ -289,18 +270,6 @@ values left bound by an older genie in a hot-reloaded session.")
     ('thinking (user-error "Genie is busy — wait, or M-x genie-abort"))
     ('validating (user-error "Genie is validating the last change — a moment"))
     (_ nil)))
-
-(defun genie--install-indicator ()
-  "Add the genie activity element to `global-mode-string' once.
-Also heal a `genie--mode-line' value left bound by an older genie:
-`defvar' keeps old values across a hot reload, and a stale static
-construct is what a frozen spinner looks like."
-  (setq genie--mode-line genie--mode-line-construct)
-  (cond ((not (listp global-mode-string))
-         (setq global-mode-string (list "" global-mode-string 'genie--mode-line)))
-        ((not (memq 'genie--mode-line global-mode-string))
-         (setq global-mode-string
-               (append global-mode-string '(genie--mode-line))))))
 
 ;;;; Git plumbing
 
@@ -321,42 +290,36 @@ construct is what a frozen spinner looks like."
   "Return the list of untracked files in the config root."
   (split-string (genie--git "ls-files" "--others" "--exclude-standard") "\n" t))
 
-(defun genie--heal-index ()
-  "Drop stale intent-to-add index entries left by an interrupted cycle.
-`genie--detect-changes' marks created files with `git add -N'; a review
-lost to an Emacs restart leaves those entries behind, and `git stash
-create' cannot merge them (\"Entry not uptodate\").  The files stay in
-the worktree as plain untracked files."
-  ;; Intent-to-add entries are exactly the "new" files of the unstaged
-  ;; diff; genuinely staged additions live in the cached diff instead.
-  (let ((ita (split-string
-              (genie--git "diff" "--name-only" "--diff-filter=A") "\n" t)))
-    (when ita
-      (apply #'genie--git "restore" "--staged" "--" ita)
-      (message "🧞 cleared a stale review's leftovers: %s"
-               (string-join ita " · ")))))
-
 (defun genie--snapshot ()
-  "Capture the pre-wish worktree: a restore point plus dirty baselines."
-  (genie--heal-index)
+  "Capture the pre-wish worktree as the restore point everything measures from."
   (let ((stash (genie--git "stash" "create" "genie pre-wish")))
-    (setq genie--pre (if (string-empty-p stash) "HEAD" stash)))
-  (setq genie--pre-dirty (split-string (genie--git "diff" "--name-only" "HEAD")
-                                       "\n" t)
-        genie--pre-untracked (genie--untracked)
-        genie--created nil))
+    (setq genie--pre (if (string-empty-p stash) "HEAD" stash)
+          genie--pre-untracked (genie--untracked)
+          genie--created nil)))
 
 (defun genie--detect-changes ()
-  "Record in `genie--changed' and `genie--created' what changed since the snapshot."
+  "Record in `genie--changed' and `genie--created' what changed since the snapshot.
+Files the agent created are staged, which is what puts them in the diff
+and lets the commit name them."
   (let ((new (cl-set-difference (genie--untracked) genie--pre-untracked
                                 :test #'equal)))
-    (when new                      ; intent-to-add: show up in git diff/commit
-      (apply #'genie--git "add" "-N" "--" new)
+    (when new
+      (apply #'genie--git "add" "--" new)
       (setq genie--created (cl-union genie--created new :test #'equal)))
     (setq genie--changed
           (cl-union (split-string (genie--git "diff" "--name-only" genie--pre)
                                   "\n" t)
                     new :test #'equal))))
+
+(defun genie--pre-dirty ()
+  "Return the files that were already uncommitted when the wish started."
+  (split-string (genie--git "diff" "--name-only" "HEAD" genie--pre) "\n" t))
+
+(defun genie--in-commit-p (file commit)
+  "Return non-nil when FILE exists in COMMIT."
+  (let ((default-directory (genie--root)))
+    (zerop (call-process "git" nil nil nil "cat-file" "-e"
+                         (concat commit ":" file)))))
 
 ;;;; The agent session
 
@@ -437,16 +400,16 @@ validates, commits and hot-reloads your edits itself."
                           :on-fail #'genie--on-fail
                           :on-exit #'genie--on-exit))))
 
+(defun genie--said-nothing-p ()
+  "Return non-nil while the turn in flight has produced no answer text."
+  (string-empty-p (string-trim genie--answer)))
+
 (defun genie--on-text (delta)
-  "Stream answer DELTA; swallow the blank chunks around tool activity."
-  (setq genie--tool nil
-        genie--answer (concat genie--answer delta))
-  (if genie--seen-text
-      (genie--emit delta)
-    (let ((trimmed (string-trim-left delta)))
-      (unless (string-empty-p trimmed)
-        (setq genie--seen-text t)
-        (genie--emit trimmed)))))
+  "Stream answer DELTA, swallowing the blank chunks around tool activity."
+  (let ((leading (genie--said-nothing-p)))
+    (setq genie--tool nil
+          genie--answer (concat genie--answer delta))
+    (genie--emit (if leading (string-trim-left delta) delta))))
 
 (defun genie--on-tool (name)
   "Log tool NAME to the transcript, leaving the mode line to the spinner.
@@ -461,7 +424,7 @@ where it would clobber whatever the user is doing there."
 
 (defun genie--on-done (answer)
   "End the turn; emit ANSWER when nothing was streamed."
-  (when (and answer (not genie--seen-text))
+  (when (and answer (genie--said-nothing-p))
     (genie--on-text answer))
   (genie--finish-turn))
 
@@ -496,12 +459,6 @@ The agent's stderr tail is surfaced so a startup failure has a reason."
 
 ;;;; Transcript buffer / turns
 
-(defconst genie--chat-mode-line
-  '(" " (:propertize "%b" face mode-line-buffer-id)
-    (:eval (let ((activity (genie--activity t)))
-             (if activity (concat "  " activity) ""))))
-  "Mode-line format of the chat buffer, shared so it can be healed.")
-
 (defvar genie-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") #'genie-send)
@@ -513,8 +470,8 @@ The agent's stderr tail is surfaced so a startup failure has a reason."
 (define-derived-mode genie-mode fundamental-mode "genie"
   "Chat with the config genie; RET sends, \\[genie-abort] aborts.
 Killing this buffer only discards the transcript view — the agent
-session lives on; `genie-quit' ends it."
-  (setq-local mode-line-format genie--chat-mode-line)
+session lives on; `genie-quit' ends it.  Activity shows in the mode
+line here as everywhere else, via `genie--indicator'."
   (visual-line-mode 1))
 
 (defun genie--insert-prompt ()
@@ -528,7 +485,6 @@ session lives on; `genie-quit' ends it."
   (let ((buf (get-buffer-create genie-buffer)))
     (with-current-buffer buf
       (unless (derived-mode-p 'genie-mode) (genie-mode))
-      (setq-local mode-line-format genie--chat-mode-line) ; heal after reload
       (when (= (point-min) (point-max))
         (insert (propertize "🧞 genie — wishes edit this very Emacs config"
                             'face 'shadow))
@@ -557,7 +513,6 @@ pending register or cantrip target — is rolled back."
         (unless genie--changed       ; refining a pending wish keeps its baseline
           (genie--snapshot)
           (setq genie--wish nil genie--repairs 0))
-        (setq genie--turn-baseline genie--changed)
         (let* ((silent (eq label 'silent))
                (label (if silent "↻ fixing what did not load" (or label wish))))
           (unless silent
@@ -573,8 +528,7 @@ pending register or cantrip target — is rolled back."
                 (insert (propertize (concat label "\n\n") 'face 'shadow))
               (insert (propertize "You: " 'face 'font-lock-keyword-face)
                       label "\n\n"))))
-        (setq genie--turn (or turn 'wish)
-              genie--seen-text nil genie--tool nil genie--answer "")
+        (setq genie--turn (or turn 'wish) genie--tool nil genie--answer "")
         (genie--install-indicator)
         (genie--set-state 'thinking)
         (message "🧞 genie is working… (M-x genie-abort interrupts)")
@@ -592,14 +546,15 @@ events cannot re-run the pipeline."
   (when (eq genie--state 'thinking)
     (setq genie--tool nil)
     (with-current-buffer (genie--buffer) (genie--insert-prompt))
-    (genie--detect-changes)
+    (let ((before genie--changed))
+      (genie--detect-changes)
+      (when (and (memq genie--turn '(spell cantrip))
+                 (cl-set-difference genie--changed before :test #'equal))
+        (message "⚠ the spell also touched files — review with M-x genie-diff")))
     (cond
      ((memq genie--turn '(spell cantrip))
       (let ((cast-now (eq genie--turn 'cantrip)))
         (setq genie--turn 'wish)
-        (when (cl-set-difference genie--changed genie--turn-baseline
-                                 :test #'equal)
-          (message "⚠ the spell also touched files — review with M-x genie-diff"))
         (genie--learn-spell genie--answer cast-now)
         (genie--set-state 'idle)))
      ((null genie--changed)
@@ -738,7 +693,7 @@ timeout rather than as a config failure."
 (defun genie--show-diff ()
   "Pop the review buffer for the pending wish."
   (let ((diff (apply #'genie--git "diff" genie--pre "--" genie--changed))
-        (mixed (cl-intersection genie--changed genie--pre-dirty :test #'equal))
+        (mixed (cl-intersection genie--changed (genie--pre-dirty) :test #'equal))
         (buf (get-buffer-create genie-diff-buffer)))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
@@ -806,8 +761,7 @@ load falls back to offering a full restart."
   "Show (or re-show) the diff of the pending change set."
   (interactive)
   (unless genie--changed (user-error "Genie: no pending changes"))
-  (unless (memq genie--state '(idle reviewing))
-    (genie--require-ready))
+  (genie--require-ready)               ; errors only while a turn is in flight
   (genie--set-state 'reviewing)
   (genie--show-diff))
 
@@ -816,13 +770,13 @@ load falls back to offering a full restart."
   (interactive)
   (unless (eq genie--state 'reviewing)
     (user-error "Genie: nothing under review (state: %s)" genie--state))
-  (let ((ok (car-safe genie--verdict)))
-    (unless ok
-      (let ((why (if genie--verdict
-                     (format "Validation failed (%s)" (cdr genie--verdict))
-                   "The change set was not validated")))
-        (unless (yes-or-no-p (format "%s — apply anyway? " why))
-          (user-error "Genie: not applied")))))
+  (unless (car-safe genie--verdict)
+    (unless (yes-or-no-p
+             (format "%s — apply anyway? "
+                     (if genie--verdict
+                         (format "Validation failed (%s)" (cdr genie--verdict))
+                       "The change set was not validated")))
+      (user-error "Genie: not applied")))
   (apply #'genie--git "commit" "-m" (format "genie: %s" genie--wish)
          "--" genie--changed)
   (push (cons 'wish (car (split-string (format "genie: %s" genie--wish) "\n")))
@@ -933,18 +887,14 @@ a remote would need a force-push afterwards."
 and HEAD is not a genie commit")))
     (when (and subject (not (equal subject head)))
       (user-error "Genie: HEAD moved since that wish (now at: %s)" head))
-    (let ((added nil) (kept nil))
-      (dolist (entry (mapcar (lambda (line) (split-string line "\t"))
-                             (split-string (genie--git "diff" "--name-status"
-                                                       "HEAD~" "HEAD")
-                                           "\n" t)))
-        (pcase (substring (car entry) 0 1)
-          ("A" (push (cadr entry) added))
-          ((or "R" "C")                 ; renamed/copied: NEW path goes away
-           (push (car (last entry)) added)
-           (when (equal (substring (car entry) 0 1) "R")
-             (push (cadr entry) kept)))
-          (_ (push (cadr entry) kept))))
+    ;; Every path the commit touched, classified by one question: did it
+    ;; exist before?  Renames are listed as their two plain paths rather
+    ;; than as a rename, so old and new fall out on the right sides.
+    (let (added kept)
+      (dolist (file (split-string (genie--git "diff" "--no-renames"
+                                              "--name-only" "HEAD~" "HEAD")
+                                  "\n" t))
+        (if (genie--in-commit-p file "HEAD~") (push file kept) (push file added)))
       ;; Edits made to the wish's OWN files after it was applied would be
       ;; discarded along with it; say so before touching anything.  Work on
       ;; other files is never in the way and is not worth mentioning.
@@ -1119,6 +1069,20 @@ the command where it was asked from."
            (message "🧞 spell failed: %s" (error-message-string err))))
   (setq genie--pending-register nil genie--cantrip-target nil))
 
+(defun genie--spell-prompt (request &optional context)
+  "Return the prompt asking the agent to conjure a command for REQUEST.
+CONTEXT, when given, is a sentence about where the command will run."
+  (format "Reply with ONLY one Emacs Lisp code block containing a single \
+interactive `defun' (a command) implementing: %s
+
+This is pure code generation — do NOT edit, create or run anything.%s
+
+The command must be self-contained (built-ins and already-loaded \
+libraries only), safe under lexical binding, named \
+`genie-spell/<short-name>' and carry a docstring in the user's language. \
+No commentary outside the code block."
+          request (if context (concat "  " context) "")))
+
 ;;;###autoload
 (defun genie-spell (request &optional register)
   "Conjure an ephemeral interactive command implementing REQUEST.
@@ -1134,16 +1098,10 @@ character) it also lands in that spell register, castable via
            (genie--read-register "🧞 Register for it (0-9, RET to skip): " t))))
   (when (string-empty-p request) (user-error "Empty spell"))
   (setq genie--pending-register register)
-  (genie--submit
-   (format "SPELL MODE — do NOT edit, create or run anything; this is pure \
-code generation. Reply with ONLY one Emacs Lisp code block containing a \
-single interactive `defun' (a command) implementing: %s. Requirements: \
-self-contained (built-ins and already-loaded libraries only), safe under \
-lexical binding, operate on the active region when that is the natural \
-reading, docstring in the user's language, name it \
-`genie-spell/<short-name>'. No commentary outside the code block." request)
-   (format "spell: %s" request)
-   'spell))
+  (genie--submit (genie--spell-prompt
+                  request "Operate on the active region when that is the \
+natural reading of the request.")
+                 (format "spell: %s" request) 'spell))
 
 (defun genie--cast-at-target (entry)
   "Invoke cantrip ENTRY in the buffer (and on the region) it was asked from."
@@ -1159,21 +1117,17 @@ reading, docstring in the user's language, name it \
             (progn (goto-char (cdr region))
                    (push-mark (car region) t t))
           (goto-char (plist-get target :point)))
-        (let ((before-journal genie--journal)
-              (before-message (current-message)))
+        (let ((journal genie--journal) (said (current-message)))
           (genie--call-spell name (genie--spell-fn entry))
-          ;; The cantrip's own words own the echo area; genie only adds the
-          ;; undo hint when there is an effect to undo, and speaks for
-          ;; itself only when the cantrip said nothing.
-          (let ((journaled (not (eq genie--journal before-journal)))
-                (spoke (let ((now (current-message)))
-                         (and now (not (equal now before-message)) now))))
-            (cond
-             ((and spoke journaled)
-              (message "%s — 🧞 genie-undo reverts it" spoke))
-             (spoke)
-             (journaled (message "🧞 %s — M-x genie-undo reverts it" name))
-             (t (message "🧞 %s" name)))))))))
+          ;; Whatever the cantrip itself said keeps the echo area; genie
+          ;; only adds the undo hint, and only when there is an effect.
+          (message "%s%s"
+                   (if (equal (current-message) said)
+                       (format "🧞 %s" name)     ; it said nothing of its own
+                     (current-message))
+                   (if (eq genie--journal journal)
+                       ""                       ; nothing to undo
+                     " — M-x genie-undo reverts it")))))))
 
 ;;;###autoload
 (defun genie-cantrip (request)
@@ -1196,21 +1150,17 @@ register (`genie-spell-bind') or made permanent (`genie-spell-keep')."
                         (cons (copy-marker (region-beginning))
                               (copy-marker (region-end))))))
   (genie--submit
-   (format "CANTRIP MODE — a one-shot action; do NOT edit, create or run \
-anything: this is pure code generation. Reply with ONLY one Emacs Lisp code \
-block containing a single interactive `defun' (a command) implementing: %s. \
-The command will be executed IMMEDIATELY in the buffer it was requested \
-from — major mode `%s', %s. Requirements: self-contained (built-ins and \
-already-loaded libraries only), safe under lexical binding, a proper \
-docstring in the user's language, name it `genie-spell/<short-name>'. No \
-commentary outside the code block."
-           request major-mode
-           (if (use-region-p)
-               (format "an active region of %d characters (take its bounds \
+   (genie--spell-prompt
+    request
+    (format "It runs IMMEDIATELY in the buffer it was asked from — major \
+mode `%s', %s."
+            major-mode
+            (if (use-region-p)
+                (format "an active region of %d characters (take its bounds \
 with (interactive \"r\"))"
-                       (- (region-end) (region-beginning)))
-             "no active region — act at point or on the whole buffer, \
-whichever the request implies"))
+                        (- (region-end) (region-beginning)))
+              "no active region — act at point or on the whole buffer, \
+whichever the request implies")))
    (format "cantrip: %s" request)
    'cantrip))
 

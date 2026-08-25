@@ -251,9 +251,9 @@ against the same restore point.
 | `genie-config-root` | `user-emacs-directory` | The git repo genie may edit |
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
 | `genie-confirm` | `'(wish risky-spell undo)` | Which actions stop to ask; the README config drops `wish` |
+| `genie-repair-attempts` | `2` | Times a failed change is handed back to the agent |
 | `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
 | `genie-validate-timeout` | `120` | Seconds before batch validation is killed (package installs are slow) |
-| `genie-repair-attempts` | `2` | Times a change that fails validation is handed back to the agent |
 | `genie-spell-risky-functions` | processes, network, deletion… | Calls a conjured spell must confirm |
 | `genie-pi-program`, `genie-pi-args`, `genie-pi-model` | | Pi invocation |
 | `genie-elmee-program`, `genie-elmee-args` | | elmee invocation |

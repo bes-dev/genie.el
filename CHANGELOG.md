@@ -3,6 +3,31 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.12.0] — 2026-08-25
+
+A simplification pass: the scar tissue of a week of patches removed.
+
+- **Created files are staged outright** instead of with `git add -N`.
+  The intent-to-add entries were what `git stash create` refused to
+  merge, so the whole class of "Entry not uptodate" wedges — and the
+  `genie--heal-index` machinery that swept up after them — is gone.
+- **The mode-line indicator is a literal form** in `global-mode-string`
+  rather than a variable holding one. A hot-reloaded genie animates
+  immediately because the form calls whatever `genie--activity` is
+  current, so the self-healing code (and the chat buffer's duplicate
+  mode line) could go.
+- **Three state variables deleted** by computing what they held:
+  `genie--seen-text` (the answer so far already says it),
+  `genie--turn-baseline` (a local in the one function that compares),
+  `genie--pre-dirty` (a question git can answer from the restore point).
+- **`genie-auto-apply` removed**, not deprecated: it was born hours
+  before `genie-confirm` replaced it, and carrying an obsolete alias for
+  a setting nobody could have configured yet is its own kind of debt.
+- **Dropping a commit asks git one question per path** — did this exist
+  before? — instead of parsing rename and copy status letters.
+- The two spell prompts became one builder; the cantrip's four-branch
+  echo-area dance became one `message` call.
+
 ## [0.11.0] — 2026-08-25
 
 Self-repair: a change that fails validation goes back to the agent, not

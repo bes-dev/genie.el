@@ -22,9 +22,9 @@
   (declare (indent 0))
   `(let* ((genie-config-root (make-temp-file "genie-tests-repo" t))
           (genie--changed nil) (genie--created nil) (genie--verdict nil)
-          (genie--pre nil) (genie--pre-dirty nil) (genie--pre-untracked nil)
+          (genie--pre nil) (genie--pre-untracked nil) (genie--repairs 0)
           (genie--wish nil) (genie--journal nil) (genie--state 'idle)
-          (genie--turn 'wish) (genie--turn-baseline nil))
+          (genie--turn 'wish))
      (unwind-protect
          (progn
            (genie--git "init" "-q")
@@ -161,7 +161,7 @@
     (genie--git "commit" "-qm" "base")
     (genie-tests--write "b.el" "(setq b 2)\n") ; user WIP before the wish
     (genie--snapshot)
-    (should (equal genie--pre-dirty '("b.el")))
+    (should (equal (genie--pre-dirty) '("b.el")))
     (genie-tests--write "a.el" "(setq a 2)\n")
     (genie-tests--write "b.el" "(setq b 3)\n")
     (genie-tests--write "c.el" "(setq c 1)\n")
@@ -170,17 +170,20 @@
                    '("a.el" "b.el" "c.el")))
     (should (equal genie--created '("c.el")))))
 
-(ert-deftest genie-snapshot-heals-stale-intent-to-add ()
-  "A leftover `git add -N' entry (interrupted review) must not break stash.
-The healed file survives in the worktree as a plain untracked file."
+(ert-deftest genie-snapshot-survives-a-staged-leftover ()
+  "A file left staged by an interrupted review must not break the snapshot.
+Created files are staged outright — the intent-to-add entries of older
+genies were what `git stash create' refused to merge."
   (genie-tests--with-repo
     (genie-tests--write "a.el" "(setq a 1)\n")
     (genie--git "add" "-A")
     (genie--git "commit" "-qm" "base")
     (genie-tests--write "GENIE.md" "# leftover manual\n")
-    (genie--git "add" "-N" "--" "GENIE.md")   ; what a lost review leaves
+    (genie--git "add" "--" "GENIE.md")         ; what a lost review leaves
     (genie--snapshot)                          ; must not signal
-    (should (member "GENIE.md" genie--pre-untracked))
+    (genie-tests--write "b.el" "(setq b 1)\n")
+    (genie--detect-changes)
+    (should (member "b.el" genie--changed))
     (should (equal (genie-tests--read "GENIE.md") "# leftover manual\n"))))
 
 (ert-deftest genie-git-reject-restores ()
@@ -324,15 +327,15 @@ worktree, and unrelated uncommitted work survives untouched."
     (should-error (genie-reject) :type 'user-error)
     (should-error (genie-undo) :type 'user-error)))
 
-(ert-deftest genie-indicator-heals-stale-values ()
-  "Install repairs a `genie--mode-line' left bound by an older genie."
-  (let ((genie--mode-line '(:eval "stale 0.6.1 construct"))
-        (global-mode-string nil))
+(ert-deftest genie-indicator-installs-once ()
+  "The activity element goes into `global-mode-string' exactly once.
+It is a literal form rather than a variable, so a reloaded genie needs
+no healing: the form calls whatever `genie--activity' is current."
+  (let ((global-mode-string nil))
     (genie--install-indicator)
-    (should (eq genie--mode-line genie--mode-line-construct))
-    (should (memq 'genie--mode-line global-mode-string))
-    (genie--install-indicator)                  ; idempotent
-    (should (= 1 (cl-count 'genie--mode-line global-mode-string)))))
+    (genie--install-indicator)
+    (should (= 1 (cl-count genie--indicator global-mode-string :test #'equal)))
+    (should (equal genie--indicator '(:eval (genie--activity))))))
 
 (ert-deftest genie-spinner-follows-state ()
   "The spinner timer runs while genie works and stops when it is quiet."
@@ -348,14 +351,14 @@ worktree, and unrelated uncommitted work survives untouched."
                                    (let ((genie--spinner-index i))
                                      (genie--activity)))
                                  '(0 1 2 3))
-                         '("🧞 thinking.  " "🧞 thinking.. "
-                           "🧞 thinking..." "🧞 thinking.  ")))
+                         '(" 🧞 thinking.  " " 🧞 thinking.. "
+                           " 🧞 thinking..." " 🧞 thinking.  ")))
           (genie--set-state 'validating)
           (should (timerp genie--spinner-timer))
           (should (string-match-p "validating\\." (genie--activity)))
           (genie--set-state 'idle)
           (should-not genie--spinner-timer)
-          (should-not (genie--activity)))
+          (should (equal (genie--activity) "")))
       (when (timerp genie--spinner-timer)
         (cancel-timer genie--spinner-timer)))))
 
@@ -369,24 +372,20 @@ worktree, and unrelated uncommitted work survives untouched."
 ;;;; genie: the confirmation dial
 
 (ert-deftest genie-confirm-dial ()
-  "`genie--confirm-p' reads the dial, and honors the obsolete flag."
-  (let ((genie-confirm '(wish risky-spell undo)) (genie-auto-apply nil))
+  "`genie--confirm-p' reads the dial."
+  (let ((genie-confirm '(wish risky-spell undo)))
     (should (genie--confirm-p 'wish))
     (should (genie--confirm-p 'undo)))
-  (let ((genie-confirm '(risky-spell)) (genie-auto-apply nil))
+  (let ((genie-confirm '(risky-spell)))
     (should-not (genie--confirm-p 'wish))
     (should (genie--confirm-p 'risky-spell)))
-  (let ((genie-confirm nil) (genie-auto-apply nil))
-    (should-not (genie--confirm-p 'risky-spell)))
-  ;; the obsolete boolean still switches the wish review off
-  (let ((genie-confirm '(wish)) (genie-auto-apply t))
-    (should-not (genie--confirm-p 'wish))))
+  (let ((genie-confirm nil))
+    (should-not (genie--confirm-p 'risky-spell))))
 
 (ert-deftest genie-instant-wish-skips-the-review ()
   "Without `wish' confirmation a validated change applies straight away."
   (let ((genie-confirm nil) (genie--state 'thinking) (genie--turn 'wish)
-        (genie--changed '("a.el")) (genie--turn-baseline nil)
-        applied shown)
+        (genie--changed '("a.el")) applied shown)
     (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
               ((symbol-function 'genie--insert-prompt) #'ignore)
               ((symbol-function 'genie--validate)
@@ -402,8 +401,7 @@ worktree, and unrelated uncommitted work survives untouched."
 BODY sees `applied', `shown', `repaired' and `gave-up'."
   (declare (indent 0))
   `(let ((genie--state 'thinking) (genie--turn 'wish)
-         (genie--changed '("a.el")) (genie--turn-baseline nil)
-         applied shown repaired gave-up)
+         (genie--changed '("a.el")) applied shown repaired gave-up)
      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
                ((symbol-function 'genie--insert-prompt) #'ignore)
                ((symbol-function 'genie--validate)
@@ -570,7 +568,7 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
 
 (ert-deftest genie-spell-pipeline ()
   "A full spell turn arms a working region command; a bad reply keeps it."
-  (let ((genie--turn 'spell) (genie--turn-baseline nil)
+  (let ((genie--turn 'spell)
         (genie--spell nil) (genie--spells nil)
         (genie--state 'thinking) (genie--changed nil)
         (genie--pending-register nil) (genie--journal nil))
@@ -706,7 +704,7 @@ The effect is gone with the revert; undo must not error or strand it."
 
 (ert-deftest genie-cantrip-pipeline ()
   "A cantrip turn executes immediately on the captured region and is undoable."
-  (let ((genie--turn 'cantrip) (genie--turn-baseline nil)
+  (let ((genie--turn 'cantrip)
         (genie--spell nil) (genie--spells nil)
         (genie--state 'thinking) (genie--changed nil) (genie--journal nil)
         (genie--pending-register nil))
