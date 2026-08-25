@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.10.0
+;; Version: 0.11.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -138,13 +138,23 @@ be slow on the first run — raise this when that bites."
 Drop `wish' for the frictionless flow the README recommends: a wish is
 validated, committed and hot-reloaded on the spot, and you judge the
 result in the running editor instead of in a diff.  Nothing is lost by
-it — every wish is still one commit that `genie-undo' takes back — and
-a wish that fails validation is still shown for review rather than
-applied.  Set to nil to never be asked anything."
+it — every wish is still one commit that `genie-undo' takes back, and a
+change that fails validation is handed back to the agent to fix (see
+`genie-repair-attempts'), then undone rather than applied, instead of
+becoming a diff you did not ask to read.  Set to nil to never be asked
+anything."
   :type '(set (const :tag "Review the diff of a wish" wish)
               (const :tag "Approve risky conjured code" risky-spell)
               (const :tag "Approve dropping a commit" undo))
   :group 'genie)
+
+(defcustom genie-repair-attempts 2
+  "How many times a change that fails validation is handed back to the agent.
+The error goes back to the agent to fix, which is where a broken change
+belongs before it reaches a person.  When the attempts run out, someone
+reviewing diffs is shown one; for everyone else the change is undone and
+reported in plain words.  Zero disables repair."
+  :type 'integer :group 'genie)
 
 (defcustom genie-auto-apply nil
   "Obsolete; non-nil is the same as dropping `wish' from `genie-confirm'."
@@ -200,6 +210,7 @@ covers an agent turn in flight; `validating' the async batch check.")
 (defvar genie--changed nil "Files changed by the pending wish.")
 (defvar genie--created nil "Files newly created by the pending wish.")
 (defvar genie--verdict nil "Validation result (OK . DETAIL), or nil when unknown.")
+(defvar genie--repairs 0 "Repair turns spent on the change under validation.")
 (defvar genie--turn 'wish "Kind of the turn in flight: `wish', `spell' or `cantrip'.")
 (defvar genie--turn-baseline nil "Value of `genie--changed' when the turn started.")
 (defvar genie--answer "" "Accumulated answer text of the turn in flight.")
@@ -535,26 +546,33 @@ session lives on; `genie-quit' ends it."
 
 (defun genie--submit (wish &optional label turn)
   "Send WISH to the agent as a TURN (default a config wish).
-The transcript and commit message use LABEL.  On any error the turn
-state — including a pending register or cantrip target — is rolled back."
+The transcript and commit message use LABEL; the symbol `silent' marks
+a follow-up genie asked for on its own — it stays out of the commit
+message and shows as a note.  On any error the turn state — including a
+pending register or cantrip target — is rolled back."
   (genie--require-ready)
   (condition-case err
       (progn
         (genie--ensure-session)
         (unless genie--changed       ; refining a pending wish keeps its baseline
           (genie--snapshot)
-          (setq genie--wish nil))
+          (setq genie--wish nil genie--repairs 0))
         (setq genie--turn-baseline genie--changed)
-        (let ((label (or label wish)))
-          (setq genie--wish (if genie--wish (concat genie--wish "; " label) label))
+        (let* ((silent (eq label 'silent))
+               (label (if silent "↻ fixing what did not load" (or label wish))))
+          (unless silent
+            (setq genie--wish
+                  (if genie--wish (concat genie--wish "; " label) label)))
           (with-current-buffer (genie--buffer)
             (when (markerp genie--input-start)
               (goto-char genie--input-start)
               (forward-line 0)
               (delete-region (point) (point-max)))
             (goto-char (point-max))
-            (insert (propertize "You: " 'face 'font-lock-keyword-face)
-                    label "\n\n")))
+            (if silent
+                (insert (propertize (concat label "\n\n") 'face 'shadow))
+              (insert (propertize "You: " 'face 'font-lock-keyword-face)
+                      label "\n\n"))))
         (setq genie--turn (or turn 'wish)
               genie--seen-text nil genie--tool nil genie--answer "")
         (genie--install-indicator)
@@ -585,13 +603,12 @@ events cannot re-run the pipeline."
         (genie--learn-spell genie--answer cast-now)
         (genie--set-state 'idle)))
      ((null genie--changed)
-      (setq genie--verdict nil)
+      (setq genie--verdict nil genie--repairs 0)
       (genie--set-state 'idle)
-      ;; Quiet when the user asked for a frictionless flow: the answer is
-      ;; in the transcript for whoever wants it, without stealing a window.
-      (if (genie--confirm-p 'wish)
-          (display-buffer (genie--buffer))
-        (message "🧞 done — no config changes (C-c g c to read the answer)")))
+      ;; Nothing changed, so the agent's words are the whole result: show
+      ;; them rather than leave the user with an empty echo-area line.
+      (display-buffer (genie--buffer))
+      (message "🧞 done — no config changes"))
      (t
       (genie--set-state 'validating)
       (message "🧞 validating %d file(s)…" (length genie--changed))
@@ -600,11 +617,46 @@ events cannot re-run the pipeline."
          (when (eq genie--state 'validating) ; ignore a stale callback
            (setq genie--verdict verdict)
            (genie--set-state 'reviewing)
-           ;; A change that fails validation is always shown, however
-           ;; frictionless the flow: that is the guarantee worth keeping.
-           (if (and (car verdict) (not (genie--confirm-p 'wish)))
-               (genie-apply)
-             (genie--show-diff)))))))))
+           (cond
+            ((car verdict)
+             (setq genie--repairs 0)
+             (if (genie--confirm-p 'wish) (genie--show-diff) (genie-apply)))
+            ;; A broken change is the agent's problem before it is the
+            ;; user's: hand the error back and let it try again.
+            ((< genie--repairs genie-repair-attempts) (genie--repair verdict))
+            ;; Out of attempts.  Someone who asked to review diffs gets
+            ;; one; someone who did not is not handed a diff and an elisp
+            ;; error to judge — the change is undone and said so plainly.
+            ((genie--confirm-p 'wish) (setq genie--repairs 0) (genie--show-diff))
+            (t (genie--give-up verdict))))))))))
+
+(defun genie--repair (verdict)
+  "Ask the agent to fix the change that failed validation with VERDICT."
+  (cl-incf genie--repairs)
+  (message "🧞 that broke the config — asking the agent to fix it (%d/%d)…"
+           genie--repairs genie-repair-attempts)
+  (genie--submit
+   (format "Your change does not load: the config now fails with
+
+  %s
+
+Fix it: find the mistake in what you just edited and correct it, keeping \
+the original request satisfied.  Do not start over and do not widen the \
+change.  Reply with a one-line note of what was wrong." (cdr verdict))
+   'silent))
+
+(defun genie--give-up (verdict)
+  "Undo the change that kept failing validation with VERDICT, and say so."
+  (let ((wish genie--wish))
+    (setq genie--repairs 0)
+    (genie--restore-worktree)
+    (genie--reset)
+    (genie--set-state 'idle)
+    (display-buffer (genie--buffer))
+    (message "🧞 couldn't do it — \"%s\" left the config unloadable (%s), so \
+nothing was changed"
+             (truncate-string-to-width wish 40 nil nil "…")
+             (truncate-string-to-width (cdr verdict) 60 nil nil "…"))))
 
 ;;;; Validation
 
@@ -715,7 +767,8 @@ timeout rather than as a config failure."
 
 (defun genie--reset ()
   "Forget the pending wish's change set."
-  (setq genie--changed nil genie--created nil genie--verdict nil))
+  (setq genie--changed nil genie--created nil genie--verdict nil
+        genie--repairs 0))
 
 (defun genie--quit-diff ()
   "Dismiss the review window when it is showing."
@@ -791,20 +844,24 @@ load falls back to offering a full restart."
                (truncate-string-to-width wish 60 nil nil "…")
                (string-join files " · ")))))
 
+(defun genie--restore-worktree ()
+  "Put every file the pending change touched back as it was before it."
+  (when-let* ((tracked (cl-set-difference genie--changed genie--created
+                                          :test #'equal)))
+    ;; --worktree only: restoring via checkout would stage the files, and a
+    ;; non-clean index later blocks the drop in `genie-undo'.
+    (apply #'genie--git "restore" "--source" genie--pre "--worktree"
+           "--" tracked))
+  (dolist (file genie--created)
+    (genie--git "restore" "--staged" "--" file)
+    (ignore-errors (delete-file (expand-file-name file (genie--root))))))
+
 (defun genie-reject ()
   "Discard the pending wish: restore every touched file to its pre-wish state."
   (interactive)
   (unless (eq genie--state 'reviewing)
     (user-error "Genie: nothing under review (state: %s)" genie--state))
-  (when-let* ((tracked (cl-set-difference genie--changed genie--created
-                                          :test #'equal)))
-    ;; --worktree only: restoring via checkout would stage the files, and a
-    ;; non-clean index later blocks `git revert' in `genie-undo'.
-    (apply #'genie--git "restore" "--source" genie--pre "--worktree"
-           "--" tracked))
-  (dolist (file genie--created)
-    (genie--git "restore" "--staged" "--" file)
-    (ignore-errors (delete-file (expand-file-name file (genie--root)))))
+  (genie--restore-worktree)
   (genie--reset)
   (genie--quit-diff)
   (genie--set-state 'idle)

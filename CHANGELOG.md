@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.11.0] — 2026-08-25
+
+Self-repair: a change that fails validation goes back to the agent, not
+to the user.
+
+- A wish whose change breaks the config now hands the error back to the
+  agent to fix, up to `genie-repair-attempts` times (default 2), before
+  anyone is bothered. The repair turn stays out of the commit message
+  and shows as a note in the transcript.
+- When the attempts run out: someone reviewing diffs gets one as before;
+  in the frictionless flow the change is undone and reported in plain
+  words — a beginner is never handed a raw diff and an elisp error to
+  judge. The worktree is left exactly as it was, with no commit.
+- A wish that changes nothing shows the agent's answer again: with no
+  diff to look at, its words are the whole result.
+
 ## [0.10.0] — 2026-08-25
 
 Ceremony became a setting, and the recommended config has none.

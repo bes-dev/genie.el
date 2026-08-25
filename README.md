@@ -34,8 +34,11 @@ git diff review:  [a] apply   [r] reject   [q] quit
 commit + hot-reload               worktree restored to the pre-wish state
 ```
 
-Either way a change that **fails validation** is always shown for review,
-never applied silently.
+A change that **fails validation** is never applied and never dumped on you
+as a diff to judge: the error goes back to the agent to fix (twice, by
+default — see `genie-repair-attempts`). If the repairs do not take, the
+change is undone and reported in plain words — *"couldn't do it, nothing
+was changed"* — unless you are reviewing diffs, in which case you get one.
 
 `M-x genie-undo` undoes the last applied wish — every wish is one git commit,
 and undoing one deletes it from history rather than piling a revert on top.
@@ -186,6 +189,9 @@ an empty `init.el` with nothing but genie in it:
 - **Validation before review** — `genie-validate` is `'batch` by default: a
   throwaway `emacs --batch -l init.el` must exit cleanly, or apply demands
   explicit confirmation. `'parens` checks bracket balance only; `nil` skips.
+- **A broken change never reaches you** — validation failure is the agent's
+  problem first: the error is handed back for repair, and a change that
+  still will not load is undone rather than applied or dropped in your lap.
 - **Ceremony is yours to choose** (`genie-confirm`) — review every diff
   (`diff-mode`, hunk navigation included), or let validated wishes apply on
   the spot and judge them in the editor. Nothing is lost by the latter: a
@@ -247,6 +253,7 @@ against the same restore point.
 | `genie-confirm` | `'(wish risky-spell undo)` | Which actions stop to ask; the README config drops `wish` |
 | `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
 | `genie-validate-timeout` | `120` | Seconds before batch validation is killed (package installs are slow) |
+| `genie-repair-attempts` | `2` | Times a change that fails validation is handed back to the agent |
 | `genie-spell-risky-functions` | processes, network, deletion… | Calls a conjured spell must confirm |
 | `genie-pi-program`, `genie-pi-args`, `genie-pi-model` | | Pi invocation |
 | `genie-elmee-program`, `genie-elmee-args` | | elmee invocation |

@@ -397,20 +397,92 @@ worktree, and unrelated uncommitted work survives untouched."
     (should applied)
     (should-not shown)))
 
-(ert-deftest genie-instant-wish-still-reviews-a-failure ()
-  "A change that fails validation is reviewed however frictionless the flow."
-  (let ((genie-confirm nil) (genie--state 'thinking) (genie--turn 'wish)
-        (genie--changed '("a.el")) (genie--turn-baseline nil)
-        applied shown)
-    (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
-              ((symbol-function 'genie--insert-prompt) #'ignore)
-              ((symbol-function 'genie--validate)
-               (lambda (cb) (funcall cb '(nil . "init.el broke"))))
-              ((symbol-function 'genie-apply) (lambda () (setq applied t)))
-              ((symbol-function 'genie--show-diff) (lambda () (setq shown t))))
-      (genie--finish-turn))
-    (should shown)
-    (should-not applied)))
+(defmacro genie-tests--failing-turn (&rest body)
+  "Run a wish turn whose validation fails, with the outcomes recorded.
+BODY sees `applied', `shown', `repaired' and `gave-up'."
+  (declare (indent 0))
+  `(let ((genie--state 'thinking) (genie--turn 'wish)
+         (genie--changed '("a.el")) (genie--turn-baseline nil)
+         applied shown repaired gave-up)
+     (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
+               ((symbol-function 'genie--insert-prompt) #'ignore)
+               ((symbol-function 'genie--validate)
+                (lambda (cb) (funcall cb '(nil . "void-function foo"))))
+               ((symbol-function 'genie-apply) (lambda () (setq applied t)))
+               ((symbol-function 'genie--show-diff) (lambda () (setq shown t)))
+               ((symbol-function 'genie--repair)
+                (lambda (_) (setq repaired t)))
+               ((symbol-function 'genie--give-up)
+                (lambda (_) (setq gave-up t))))
+       (genie--finish-turn))
+     ,@body))
+
+(ert-deftest genie-failed-validation-goes-back-to-the-agent ()
+  "A broken change is handed back for repair before anyone is bothered."
+  (dolist (confirm '(nil (wish)))            ; in both flows
+    (let ((genie-confirm confirm) (genie-repair-attempts 2) (genie--repairs 0))
+      (genie-tests--failing-turn
+        (should repaired)
+        (should-not (or applied shown gave-up))
+        (should (= genie--repairs 0))))))    ; the stub did not count a try
+
+(ert-deftest genie-exhausted-repairs-undo-quietly-in-the-instant-flow ()
+  "Out of attempts, a beginner gets the change undone — not a diff to judge."
+  (let ((genie-confirm nil) (genie-repair-attempts 2) (genie--repairs 2))
+    (genie-tests--failing-turn
+      (should gave-up)
+      (should-not (or applied shown repaired)))))
+
+(ert-deftest genie-exhausted-repairs-review-when-asked ()
+  "Out of attempts, someone who reviews diffs is shown one."
+  (let ((genie-confirm '(wish)) (genie-repair-attempts 2) (genie--repairs 2))
+    (genie-tests--failing-turn
+      (should shown)
+      (should-not (or applied gave-up repaired))
+      (should (= genie--repairs 0)))))       ; the counter is cleared for next time
+
+(ert-deftest genie-give-up-restores-the-worktree ()
+  "Giving up undoes the change: files restored, created ones deleted."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (genie--snapshot)
+    (genie-tests--write "a.el" "(setq a (broken\n")
+    (genie-tests--write "new.el" "(setq new 1)\n")
+    (genie--detect-changes)
+    (setq genie--wish "break everything" genie--repairs 2)
+    (cl-letf (((symbol-function 'display-buffer) #'ignore))
+      (genie--give-up '(nil . "end-of-file")))
+    (should (equal (genie-tests--read "a.el") "(setq a 1)\n"))
+    (should-not (file-exists-p (expand-file-name "new.el" (genie--root))))
+    (should-not genie--changed)
+    (should (eq genie--state 'idle))
+    (should (= genie--repairs 0))
+    ;; nothing was committed, and the index is clean for the next wish
+    (should (equal (genie--git "log" "--format=%s") "base"))
+    (should (equal (genie--git "status" "--porcelain") ""))))
+
+(ert-deftest genie-repair-turn-stays-out-of-the-commit-message ()
+  "A repair turn does not append itself to the wish used as commit message."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (let ((genie--state 'idle) (genie--changed nil) (genie--wish nil)
+          (genie--repairs 0) sent)
+      (cl-letf (((symbol-function 'genie--ensure-session) #'ignore)
+                ((symbol-function 'genie-rpc-prompt)
+                 (lambda (_rpc text) (setq sent text)))
+                ((symbol-function 'genie--install-indicator) #'ignore))
+        (genie--submit "add a keybinding")
+        (should (equal genie--wish "add a keybinding"))
+        (setq genie--changed '("a.el"))      ; a change is now pending
+        (genie--set-state 'reviewing)
+        (genie--repair '(nil . "void-function foo"))
+        (should (equal genie--wish "add a keybinding"))   ; unchanged
+        (should (string-match-p "void-function foo" sent))
+        (should (= genie--repairs 1))))))
 
 (ert-deftest genie-instant-undo-skips-the-prompt ()
   "Without `undo' confirmation the commit is dropped without asking…"
