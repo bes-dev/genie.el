@@ -14,7 +14,7 @@ Every **wish** goes through a full safety pipeline:
 M-x genie "bind buffer formatting via black to C-c f"
    │
    ▼
-async RPC agent edits your config files (Pi or elmee backend)
+the elmee agent edits your config files (async, over ACP)
    │
    ▼
 validation — a batch subprocess must load init.el cleanly
@@ -67,9 +67,40 @@ then dropped from history and re-reloaded) or the buffer effect of a spell, regi
 cast or cantrip (undone precisely in the buffer it edited, even if you've
 moved elsewhere since).
 
-The UI never blocks: the agent runs as an async subprocess, tokens and tool
-activity stream live into the `*genie*` transcript (which doubles as a
-multi-turn chat via `M-x genie-chat`).
+The UI never blocks: the agent runs as an async subprocess, and tokens and
+tool activity stream live into the `*genie*` chat.
+
+## The agent, anywhere
+
+The lamp is one use of a general thing: a chat with the
+[elmee](https://github.com/bes-dev/elmee) agent about a directory.
+`M-x genie-ask` (`C-c g a`) opens the chat for the project you are in and
+hands the agent what you are looking at — the active region, or with `C-u`
+the whole file (in Dired, the directory). `*genie*` itself is such a chat,
+about your config, with the wish pipeline wrapped around every turn.
+
+In any chat:
+
+- **Type ahead.** Answers stream in above the prompt, so the next message can
+  be written while the agent works. `RET` sends, `C-c C-k` stops the turn.
+- **Skills.** Whatever skills the agent has are commands here: `/pdf
+  report.pdf`, `/kb что у меня про X`. `TAB` completes the name, `C-c C-/`
+  picks one from a list. A skill is a `SKILL.md` — add a capability by
+  dropping a file under `~/.agents/skills/`, no Emacs package needed.
+- **Past conversations.** `C-c C-s` (or `M-x genie-sessions`) lists the
+  conversations kept for the directory — when, how much was asked, what
+  about. `RET` returns to one: the chat fills with what was said and goes on
+  from there. `n` starts a new one, `d` deletes. They are elmee's files, so
+  they survive restarts; `C-c C-n` starts afresh without the list.
+- **The model.** `C-c C-m` switches it mid-conversation. The header line
+  shows the model, how full its context is, and the step of the plan the
+  agent is on.
+- **Questions.** When the agent needs a decision it asks in the minibuffer,
+  with its options as completions.
+- **Links.** Paths in an answer open on `RET`/click; `[[wikilinks]]` open
+  the page of that name under `genie-chat-wiki-roots`.
+- **Signing in.** A model that needs an account says so; `M-x genie-login`
+  runs elmee's browser sign-in.
 
 ## Install
 
@@ -85,6 +116,7 @@ Not on MELPA yet. With `straight.el`:
           (genie-confirm '(risky-spell))
   :bind (("C-c g g" . genie)
          ("C-c g c" . genie-chat)
+         ("C-c g a" . genie-ask)
          ("C-c g d" . genie-diff)
          ("C-c g u" . genie-undo)
          ("C-c g k" . genie-abort)
@@ -97,16 +129,11 @@ Not on MELPA yet. With `straight.el`:
 
 Or clone and `(add-to-list 'load-path "…/genie.el") (require 'genie)`.
 
-You also need one of the agent backends on `PATH`:
-
-- **[elmee](https://github.com/bes-dev/elmee)** (default) — a fast agent
-  microkernel in Rust, driven over the standard
-  [Agent Client Protocol](https://agentclientprotocol.com) (`elmee --acp`):
-  one warm JSON-RPC server process holds the session. Pass a model via
-  `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`.
-- **[Pi](https://github.com/badlogic/pi-mono)** — one persistent
-  `pi --mode rpc` process speaking Pi's own line-delimited JSON. Select with
-  `(setq genie-backend 'pi)`; pin a model with `genie-pi-model`.
+You also need **[elmee](https://github.com/bes-dev/elmee)** on `PATH` — a
+fast agent microkernel in Rust, driven over the standard
+[Agent Client Protocol](https://agentclientprotocol.com) (`elmee --acp`).
+Pass a model via `genie-elmee-args`, e.g. `'("-m" "ollama/qwen3-coder:latest")`,
+or switch it inside a chat with `C-c C-m`.
 
 ## Starting from nothing
 
@@ -130,7 +157,8 @@ and nothing else. Everything it will ever have arrives as a wish.
 
 ;; The lamp's controls.
 (global-set-key (kbd "C-c g g") #'genie)         ; state a wish
-(global-set-key (kbd "C-c g c") #'genie-chat)    ; multi-turn chat
+(global-set-key (kbd "C-c g c") #'genie-chat)    ; the chat about this config
+(global-set-key (kbd "C-c g a") #'genie-ask)     ; the agent, about where you are
 (global-set-key (kbd "C-c g d") #'genie-diff)    ; review the pending diff
 (global-set-key (kbd "C-c g u") #'genie-undo)    ; undo the last wish
 (global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
@@ -204,8 +232,12 @@ an empty `init.el` with nothing but genie in it:
 - **Scoped agent** — the system prompt confines edits to `genie-config-root`;
   interactive approval requests from the agent are denied by policy.
 - **Spells never touch disk** — a generated `defun` only defines a command;
-  side effects happen when *you* cast it. If a spell turn did touch files,
-  genie warns and routes the changes into the usual review.
+  side effects happen when *you* cast it. The agent that writes it has no
+  tools at all, so there is nothing it could touch.
+- **A turn that did not finish is not applied** — stopped with
+  `genie-abort`, cut off by the step limit, or lost with the agent process,
+  whatever was half-edited is held for review (`genie-diff`,
+  `genie-reject`) rather than validated and committed.
 - **Risky code is screened** — conjured code that calls processes, the
   network, file deletion or anything else in `genie-spell-risky-functions`
   needs explicit confirmation *before it is evaluated*; everything else
@@ -226,7 +258,10 @@ an empty `init.el` with nothing but genie in it:
 | Command | Suggested key | Description |
 |---|---|---|
 | `genie` | `C-c g g` | State a wish from the minibuffer |
-| `genie-chat` | `C-c g c` | Transcript as a multi-turn chat (RET sends) |
+| `genie-chat` | `C-c g c` | The chat about this config (RET sends) |
+| `genie-ask` | `C-c g a` | The chat for the current project, with the region or file attached |
+| `genie-sessions` | `C-c C-s` in a chat | Past conversations of a directory: return, start, delete |
+| `genie-login` | — | Sign the agent in (elmee's browser flow) |
 | `genie-diff` | `C-c g d` | Review the pending diff (`a` apply, `r` reject) |
 | `genie-undo` | `C-c g u` | Undo the last genie-made change, whatever its kind |
 | `genie-abort` | `C-c g k` | Abort the turn in flight |
@@ -238,7 +273,7 @@ an empty `init.el` with nothing but genie in it:
 | `genie-spell-keep` | — | Make the current spell permanent |
 | `genie-manual` | `C-c g m` | Open the config's user manual, grown wish by wish |
 | `genie-journal` | — | Preview what `genie-undo` would undo, newest first |
-| `genie-quit` | — | End the agent session (fresh charter on the next wish) |
+| `genie-quit` | — | End the agents and close the config chat (fresh charter on the next wish) |
 
 Wishes stated while a diff is pending refine it: the review stays cumulative
 against the same restore point.
@@ -247,7 +282,6 @@ against the same restore point.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `genie-backend` | `'pi` | Agent backend: `'pi` or `'elmee` |
 | `genie-config-root` | `user-emacs-directory` | The git repo genie may edit |
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
 | `genie-confirm` | `'(wish risky-spell undo)` | Which actions stop to ask; the README config drops `wish` |
@@ -255,31 +289,33 @@ against the same restore point.
 | `genie-manual-file` | `"GENIE.md"` | The agent-maintained user manual, relative to the root |
 | `genie-validate-timeout` | `120` | Seconds before batch validation is killed (package installs are slow) |
 | `genie-spell-risky-functions` | processes, network, deletion… | Calls a conjured spell must confirm |
-| `genie-pi-program`, `genie-pi-args`, `genie-pi-model` | | Pi invocation |
 | `genie-elmee-program`, `genie-elmee-args` | | elmee invocation |
+| `genie-chat-show-thoughts` | `nil` | Write a model's reasoning into the chat |
+| `genie-chat-wiki-roots` | `nil` | Where a `[[wikilink]]` in an answer is looked up |
 
-## genie-rpc: the generic layer
+## The layers
 
-All agent plumbing lives in **`genie-rpc.el`**, an application-agnostic
-library you can reuse for any AI-based Emacs package: async stdio transport
-with line framing, an [ACP](https://agentclientprotocol.com) client
-(JSON-RPC 2.0 with request correlation, the initialize/session handshake and
-a prompt queue until the session is open), agent stderr capture, and
-normalization of each backend's wire protocol into plain callbacks:
+- **`genie-acp.el`** — an [ACP](https://agentclientprotocol.com) client for
+  elmee: one warm process, any number of sessions, everything through
+  callbacks. Reusable by any Emacs package:
 
-```elisp
-(setq rpc (genie-rpc-open 'elmee (list "elmee" "--acp")
-                          :directory "~/project/"
-                          :on-text  (lambda (delta)  …)
-                          :on-tool  (lambda (label)  …)
-                          :on-done  (lambda (answer) …)
-                          :on-fail  (lambda (msg)    …)))
-(genie-rpc-prompt rpc "Refactor foo.el")
-```
+  ```elisp
+  (setq agent (genie-acp-agent '("elmee" "--acp")))
+  (setq session (genie-acp-open agent "~/project/"
+                                :on-text (lambda (delta) …)
+                                :on-done (lambda (stop-reason) …)))
+  (genie-acp-prompt session "Refactor foo.el")
+  ```
 
-Adding a backend is one entry in `genie-rpc-backends` — a prompt sender, a
-dispatcher and optional handshake/abort hooks. Nothing in `genie.el` knows
-any agent's JSON.
+- **`genie-chat.el`** — the chat buffer and the list of conversations,
+  for any directory.
+- **`genie.el`** — the lamp: the wish pipeline around the config's chat,
+  spells, and the one undo.
+
+Spells are conjured by a second elmee process that carries no tools, no
+history and a one-line system prompt, each in a conversation of its own: a
+cantrip sends the model about a kilobyte, not a session's worth — which is
+what makes it quick on a local model.
 
 ## Development
 

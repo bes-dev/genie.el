@@ -50,7 +50,8 @@ cat > "$EMACS_D/init.el" <<'EOF'
 
 ;; The lamp's controls.
 (global-set-key (kbd "C-c g g") #'genie)         ; state a wish
-(global-set-key (kbd "C-c g c") #'genie-chat)    ; multi-turn chat
+(global-set-key (kbd "C-c g c") #'genie-chat)    ; the chat about this config
+(global-set-key (kbd "C-c g a") #'genie-ask)     ; the agent, about where you are
 (global-set-key (kbd "C-c g d") #'genie-diff)    ; review the pending diff
 (global-set-key (kbd "C-c g u") #'genie-undo)    ; revert the last wish
 (global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight

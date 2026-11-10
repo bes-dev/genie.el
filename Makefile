@@ -1,5 +1,5 @@
 EMACS ?= emacs
-FILES  = genie-rpc.el genie.el
+FILES  = genie-acp.el genie-chat.el genie.el
 
 .PHONY: all compile checkdoc test lint clean
 

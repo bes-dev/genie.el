@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.12.0
+;; Version: 0.13.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -47,10 +47,13 @@
 ;; effect of a spell, register cast or cantrip.  `genie-journal'
 ;; previews the stack.
 ;;
-;; Everything is async, built on the genie-rpc library, with two agent
-;; backends (`genie-backend'): the elmee agent microkernel by default,
-;; driven over the standard Agent Client Protocol (`elmee --acp'), and
-;; the Pi coding agent.  A turn's progress is visible in every mode line.
+;; Everything is async, on the elmee agent (`elmee --acp') through
+;; genie-chat: the `*genie*' buffer is an ordinary chat about this
+;; configuration — skills, past conversations, model switching and all —
+;; whose every turn also runs the pipeline above.  Spells are conjured
+;; by a second, bare agent that carries no tools and no history, so a
+;; cantrip costs a few hundred bytes of prompt rather than a session's
+;; worth.  A turn's progress is visible in every mode line.
 ;;
 ;; Setup:
 ;;
@@ -60,6 +63,7 @@
 ;;   ;; recommended bindings:
 ;;   (global-set-key (kbd "C-c g g") #'genie)
 ;;   (global-set-key (kbd "C-c g c") #'genie-chat)
+;;   (global-set-key (kbd "C-c g a") #'genie-ask)
 ;;   (global-set-key (kbd "C-c g d") #'genie-diff)
 ;;   (global-set-key (kbd "C-c g u") #'genie-undo)
 ;;   (global-set-key (kbd "C-c g k") #'genie-abort)
@@ -75,41 +79,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'diff-mode)
-(require 'genie-rpc)
-
-(defgroup genie nil
-  "Wish-driven, self-modifying Emacs configuration."
-  :group 'tools
-  :prefix "genie-")
-
-(defcustom genie-backend 'elmee
-  "Agent backend: the elmee microkernel agent (default) or the Pi agent.
-Elmee is driven over the standard Agent Client Protocol (`elmee --acp');
-Pi over its own line-delimited JSON RPC (`pi --mode rpc')."
-  :type '(choice (const elmee) (const pi))
-  :group 'genie)
-
-(defcustom genie-pi-program "pi"
-  "Path to the Pi executable."
-  :type 'string :group 'genie)
-
-(defcustom genie-pi-args '("--mode" "rpc" "--no-session")
-  "Base arguments for Pi's RPC mode."
-  :type '(repeat string) :group 'genie)
-
-(defcustom genie-pi-model nil
-  "Extra Pi arguments to pin a provider/model.
-For example (\"--model\" \"qwen/qwen3.6-27b\"); nil uses Pi's default."
-  :type '(repeat string) :group 'genie)
-
-(defcustom genie-elmee-program "elmee"
-  "Path to the elmee executable."
-  :type 'string :group 'genie)
-
-(defcustom genie-elmee-args nil
-  "Extra elmee arguments, for example (\"-m\" \"ollama/qwen3-coder:latest\").
-Nil uses elmee's own model resolution."
-  :type '(repeat string) :group 'genie)
+(require 'genie-chat)
 
 (defcustom genie-config-root user-emacs-directory
   "Root of the configuration the genie may edit.
@@ -186,14 +156,12 @@ lifetime is screened before the code is evaluated."
 (defconst genie-diff-buffer "*genie-diff*"
   "Name of the pending-wish review buffer.")
 
-(defvar genie--rpc nil "The `genie-rpc-session' to the agent, or nil.")
+(defvar genie--spell-agent nil "The bare agent that conjures spells, or nil.")
+(defvar genie--spell-session nil "The conjuring in flight, or nil.")
 (defvar genie--state 'idle
   "The turn state machine: `idle', `thinking', `validating' or `reviewing'.
 New turns start from `idle' or `reviewing' (a refinement); `thinking'
 covers an agent turn in flight; `validating' the async batch check.")
-(defvar genie--tool nil "Name of the tool currently running.")
-(defvar genie--ctxfile nil "Temp file holding Pi's system-prompt addendum.")
-(defvar genie--input-start nil "Marker where the chat input begins.")
 (defvar genie--wish nil "Wish text of the pending turn(s), used as commit message.")
 (defvar genie--wish-history nil "Minibuffer history for wishes.")
 (defvar genie--spell-history nil "Minibuffer history for spells and cantrips.")
@@ -203,8 +171,6 @@ covers an agent turn in flight; `validating' the async batch check.")
 (defvar genie--created nil "Files newly created by the pending wish.")
 (defvar genie--verdict nil "Validation result (OK . DETAIL), or nil when unknown.")
 (defvar genie--repairs 0 "Repair turns spent on the change under validation.")
-(defvar genie--turn 'wish "Kind of the turn in flight: `wish', `spell' or `cantrip'.")
-(defvar genie--answer "" "Accumulated answer text of the turn in flight.")
 (defvar genie--spell nil "The current conjured spell entry, or nil.")
 (defvar genie--spells nil
   "Spell entries (NAME FUNCTION CODE) conjured this session, newest first.
@@ -374,189 +340,76 @@ validates, commits and hot-reloads your edits itself."
             root emacs-version genie-manual-file)))
 
 (defun genie--command ()
-  "Return the agent argv for the configured backend, system prompt included."
-  (pcase genie-backend
-    ('elmee (append (list genie-elmee-program "--acp"
-                          "--append-system-prompt" (genie--context-prompt))
-                    genie-elmee-args))
-    (_ (setq genie--ctxfile
-             (make-temp-file "genie-ctx" nil ".md" (genie--context-prompt)))
-       (append (list genie-pi-program) genie-pi-args genie-pi-model
-               (list "--append-system-prompt" genie--ctxfile)))))
+  "Return the argv of the config's agent: elmee, carrying the charter."
+  (append (genie-chat-command)
+          (list "--append-system-prompt" (genie--context-prompt))))
 
-(defun genie--ensure-session ()
-  "Create (or recreate after a backend switch) the agent RPC session."
-  (when (and genie--rpc
-             (not (eq (genie-rpc-session-backend genie--rpc) genie-backend)))
-    (genie-rpc-close genie--rpc)
-    (setq genie--rpc nil))
-  (unless genie--rpc
-    (setq genie--rpc
-          (genie-rpc-open genie-backend (genie--command)
-                          :directory (genie--root)
-                          :on-text #'genie--on-text
-                          :on-tool #'genie--on-tool
-                          :on-done #'genie--on-done
-                          :on-fail #'genie--on-fail
-                          :on-exit #'genie--on-exit))))
+(defun genie--buffer ()
+  "Return the chat about this configuration, creating it when needed.
+It is an ordinary `genie-chat' whose turns are bracketed by the wish
+pipeline: a snapshot before, change detection and validation after."
+  (genie-chat-open (genie--root) :name genie-buffer
+                   :command (genie--command)
+                   :start #'genie--turn-starting
+                   :finish #'genie--turn-ended))
 
-(defun genie--said-nothing-p ()
-  "Return non-nil while the turn in flight has produced no answer text."
-  (string-empty-p (string-trim genie--answer)))
-
-(defun genie--on-text (delta)
-  "Stream answer DELTA, swallowing the blank chunks around tool activity."
-  (let ((leading (genie--said-nothing-p)))
-    (setq genie--tool nil
-          genie--answer (concat genie--answer delta))
-    (genie--emit (if leading (string-trim-left delta) delta))))
-
-(defun genie--on-tool (name)
-  "Log tool NAME to the transcript, leaving the mode line to the spinner.
-The play-by-play belongs in the `*genie*' log — not in the echo area,
-where it would clobber whatever the user is doing there."
-  (setq genie--tool name)
-  (with-current-buffer (genie--buffer)
-    (unless (or (= (point-min) (point-max))
-                (eq (char-before (point-max)) ?\n))
-      (genie--emit "\n")))
-  (genie--emit (format "⏳ %s\n" name) 'shadow))
-
-(defun genie--on-done (answer)
-  "End the turn; emit ANSWER when nothing was streamed."
-  (when (and answer (genie--said-nothing-p))
-    (genie--on-text answer))
-  (genie--finish-turn))
-
-(defun genie--on-fail (msg)
-  "Report agent failure MSG and end the turn (partial edits still reviewed)."
-  (genie--emit (format "\n[%s]\n" msg) 'error)
-  (genie--finish-turn))
-
-(defun genie--on-exit ()
-  "Handle the agent process dying; salvage a turn that was in flight.
-The agent's stderr tail is surfaced so a startup failure has a reason."
-  (when (eq genie--state 'thinking)
-    (genie--emit "\n[genie: agent process exited]\n" 'error)
-    (when-let* ((err (genie-rpc-stderr genie--rpc)))
-      (genie--emit (concat err "\n") 'error))
-    (display-buffer (genie--buffer))
-    (genie--finish-turn))
-  (force-mode-line-update t))
+(defun genie--emit (text &optional face)
+  "Write TEXT (in FACE) into the config chat as an aside."
+  (genie-chat-note text face (genie--buffer)))
 
 (defun genie--cleanup ()
-  "Close the RPC session and delete temp files (Emacs exit / `genie-quit')."
-  (when genie--rpc
-    (genie-rpc-close genie--rpc)
-    (setq genie--rpc nil))
-  (when (and genie--ctxfile (file-exists-p genie--ctxfile))
-    (ignore-errors (delete-file genie--ctxfile)))
-  (setq genie--turn 'wish
-        genie--cantrip-target nil genie--pending-register nil)
+  "End both agents and forget the conversation (`genie-quit', Emacs exit)."
+  (when genie--spell-agent
+    (genie-acp-shutdown genie--spell-agent)
+    (setq genie--spell-agent nil genie--spell-session nil))
+  (when-let* ((chat (get-buffer genie-buffer)))
+    (kill-buffer chat))
+  (setq genie--cantrip-target nil genie--pending-register nil)
   (genie--set-state 'idle))
 
 (add-hook 'kill-emacs-hook #'genie--cleanup)
 
-;;;; Transcript buffer / turns
+;;;; Turns
 
-(defvar genie-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") #'genie-send)
-    (define-key map (kbd "C-j") #'newline)
-    (define-key map (kbd "C-c C-k") #'genie-abort)
-    map)
-  "Keymap for `genie-mode'.")
-
-(define-derived-mode genie-mode fundamental-mode "genie"
-  "Chat with the config genie; RET sends, \\[genie-abort] aborts.
-Killing this buffer only discards the transcript view — the agent
-session lives on; `genie-quit' ends it.  Activity shows in the mode
-line here as everywhere else, via `genie--indicator'."
-  (visual-line-mode 1))
-
-(defun genie--insert-prompt ()
-  "Append a fresh input prompt to the transcript."
-  (goto-char (point-max))
-  (insert "\n\n" (propertize "❯ " 'face 'minibuffer-prompt))
-  (setq genie--input-start (point-marker)))
-
-(defun genie--buffer ()
-  "Return the transcript buffer, creating and priming it when needed."
-  (let ((buf (get-buffer-create genie-buffer)))
-    (with-current-buffer buf
-      (unless (derived-mode-p 'genie-mode) (genie-mode))
-      (when (= (point-min) (point-max))
-        (insert (propertize "🧞 genie — wishes edit this very Emacs config"
-                            'face 'shadow))
-        (genie--insert-prompt)))
-    buf))
-
-(defun genie--emit (text &optional face)
-  "Append TEXT (optionally with FACE) to the transcript and follow the tail."
-  (with-current-buffer (genie--buffer)
-    (save-excursion
-      (goto-char (point-max))
-      (insert (if face (propertize text 'face face) text)))
-    (when-let* ((window (get-buffer-window (current-buffer))))
-      (set-window-point window (point-max)))))
-
-(defun genie--submit (wish &optional label turn)
-  "Send WISH to the agent as a TURN (default a config wish).
-The transcript and commit message use LABEL; the symbol `silent' marks
-a follow-up genie asked for on its own — it stays out of the commit
-message and shows as a note.  On any error the turn state — including a
-pending register or cantrip target — is rolled back."
+(defun genie--turn-starting (label)
+  "Open the pipeline for a turn of the config chat.
+LABEL is what was asked — it becomes part of the commit message — or
+the symbol `note' for a follow-up genie sent on its own.  Called for
+every turn, typed into the chat or made as a wish, before it is sent;
+an error here refuses it."
   (genie--require-ready)
-  (condition-case err
-      (progn
-        (genie--ensure-session)
-        (unless genie--changed       ; refining a pending wish keeps its baseline
-          (genie--snapshot)
-          (setq genie--wish nil genie--repairs 0))
-        (let* ((silent (eq label 'silent))
-               (label (if silent "↻ fixing what did not load" (or label wish))))
-          (unless silent
-            (setq genie--wish
-                  (if genie--wish (concat genie--wish "; " label) label)))
-          (with-current-buffer (genie--buffer)
-            (when (markerp genie--input-start)
-              (goto-char genie--input-start)
-              (forward-line 0)
-              (delete-region (point) (point-max)))
-            (goto-char (point-max))
-            (if silent
-                (insert (propertize (concat label "\n\n") 'face 'shadow))
-              (insert (propertize "You: " 'face 'font-lock-keyword-face)
-                      label "\n\n"))))
-        (setq genie--turn (or turn 'wish) genie--tool nil genie--answer "")
-        (genie--install-indicator)
-        (genie--set-state 'thinking)
-        (message "🧞 genie is working… (M-x genie-abort interrupts)")
-        (genie-rpc-prompt genie--rpc wish))
-    (error
-     (setq genie--turn 'wish
-           genie--pending-register nil genie--cantrip-target nil)
-     (genie--set-state (if genie--changed 'reviewing 'idle))
-     (signal (car err) (cdr err)))))
+  (unless genie--changed          ; refining a pending wish keeps its baseline
+    (genie--snapshot)
+    (setq genie--wish nil genie--repairs 0))
+  (unless (eq label 'note)
+    (setq genie--wish (if genie--wish (concat genie--wish "; " label) label)))
+  (genie--install-indicator)
+  (genie--set-state 'thinking))
 
-(defun genie--finish-turn ()
-  "End the turn in flight: arm a spell, or detect, validate and review edits.
-A no-op unless a turn is actually in flight, so late or duplicate agent
-events cannot re-run the pipeline."
+(defun genie--submit (wish &optional label)
+  "Send WISH to the config's agent.
+The transcript and the commit message use LABEL instead when given; the
+symbol `silent' marks a follow-up genie asked for on its own, which
+stays out of the commit message and shows as a note."
+  (genie--require-ready)
+  (let ((silent (eq label 'silent)))
+    (when silent (genie--emit "↻ fixing what did not load\n"))
+    (genie-chat-submit (genie--buffer) wish (if silent 'note label))
+    (message "🧞 genie is working… (M-x genie-abort interrupts)")))
+
+(defun genie--turn-ended (stop _answer)
+  "Close the pipeline for a turn of the config chat that ended with STOP."
+  (genie--finish-turn stop))
+
+(defun genie--finish-turn (&optional stop)
+  "End the turn in flight: detect what it changed, then validate and review.
+STOP is why the turn ended; anything but a normal end means the agent
+did not finish what it was doing, and what it left is held for review
+rather than validated and applied.  A no-op unless a turn is actually
+in flight, so late or duplicate agent events cannot re-run the pipeline."
   (when (eq genie--state 'thinking)
-    (setq genie--tool nil)
-    (with-current-buffer (genie--buffer) (genie--insert-prompt))
-    (let ((before genie--changed))
-      (genie--detect-changes)
-      (when (and (memq genie--turn '(spell cantrip))
-                 (cl-set-difference genie--changed before :test #'equal))
-        (message "⚠ the spell also touched files — review with M-x genie-diff")))
+    (genie--detect-changes)
     (cond
-     ((memq genie--turn '(spell cantrip))
-      (let ((cast-now (eq genie--turn 'cantrip)))
-        (setq genie--turn 'wish)
-        (genie--learn-spell genie--answer cast-now)
-        (genie--set-state 'idle)))
      ((null genie--changed)
       (setq genie--verdict nil genie--repairs 0)
       (genie--set-state 'idle)
@@ -564,6 +417,14 @@ events cannot re-run the pipeline."
       ;; them rather than leave the user with an empty echo-area line.
       (display-buffer (genie--buffer))
       (message "🧞 done — no config changes"))
+     ((not (member stop '(nil "end_turn")))
+      ;; Stopped, refused or dead in the middle of an edit.  Half a change
+      ;; is nobody's wish: it is neither committed nor thrown away unasked.
+      (setq genie--verdict nil genie--repairs 0)
+      (genie--set-state 'reviewing)
+      (message "🧞 the turn did not finish — %d file(s) left half-changed: \
+M-x genie-diff shows them, M-x genie-reject restores them"
+               (length genie--changed)))
      (t
       (genie--set-state 'validating)
       (message "🧞 validating %d file(s)…" (length genie--changed))
@@ -1069,6 +930,56 @@ the command where it was asked from."
            (message "🧞 spell failed: %s" (error-message-string err))))
   (setq genie--pending-register nil genie--cantrip-target nil))
 
+(defun genie--spell-command ()
+  "Return the argv of the agent that conjures spells.
+A spell is one function written from one request, so its agent carries
+no tools, no history and a one-line prompt: what reaches the model is
+the request and little else, which is what makes a cantrip quick on a
+local model."
+  (append (list genie-elmee-program "--acp" "--no-session" "--tools" ""
+                "--system-prompt"
+                (format "You write Emacs Lisp for Emacs %s. Reply with code \
+only." emacs-version))
+          genie-elmee-args))
+
+(defun genie--conjure (prompt label &optional cast-now)
+  "Ask the spell agent for the command PROMPT describes.
+LABEL names the request in the transcript.  The answer is learnt as a
+spell and, with CAST-NOW, invoked where it was asked from.  Each
+conjuring is a conversation of its own, closed when it answers."
+  (genie--require-ready)
+  (unless genie--spell-agent
+    (setq genie--spell-agent (genie-acp-agent (genie--spell-command))))
+  (let* ((answer "")
+         (finish
+          (lambda (failure)
+            (when genie--spell-session
+              (genie-acp-close genie--spell-session)
+              (setq genie--spell-session nil)
+              (genie--set-state 'idle)
+              (if failure
+                  (progn
+                    (setq genie--pending-register nil genie--cantrip-target nil)
+                    (message "🧞 spell failed: %s" failure))
+                (genie--emit (format "%s\n%s\n" label (string-trim answer)))
+                (genie--learn-spell answer cast-now))))))
+    (setq genie--spell-session
+          (genie-acp-open
+           genie--spell-agent (genie--root)
+           :on-text (lambda (delta) (setq answer (concat answer delta)))
+           :on-done (lambda (stop)
+                      (funcall finish (and (not (equal stop "end_turn")) stop)))
+           :on-fail (lambda (reason _code) (funcall finish reason))
+           :on-exit (lambda ()
+                      (funcall finish
+                               (or (genie-acp-stderr genie--spell-agent 3)
+                                   "the agent process exited")))))
+    (genie--install-indicator)
+    (genie--set-state 'thinking)
+    (condition-case err
+        (genie-acp-prompt genie--spell-session prompt)
+      (error (funcall finish (error-message-string err))))))
+
 (defun genie--spell-prompt (request &optional context)
   "Return the prompt asking the agent to conjure a command for REQUEST.
 CONTEXT, when given, is a sentence about where the command will run."
@@ -1098,10 +1009,10 @@ character) it also lands in that spell register, castable via
            (genie--read-register "🧞 Register for it (0-9, RET to skip): " t))))
   (when (string-empty-p request) (user-error "Empty spell"))
   (setq genie--pending-register register)
-  (genie--submit (genie--spell-prompt
-                  request "Operate on the active region when that is the \
+  (genie--conjure (genie--spell-prompt
+                   request "Operate on the active region when that is the \
 natural reading of the request.")
-                 (format "spell: %s" request) 'spell))
+                  (format "spell: %s" request)))
 
 (defun genie--cast-at-target (entry)
   "Invoke cantrip ENTRY in the buffer (and on the region) it was asked from."
@@ -1149,7 +1060,7 @@ register (`genie-spell-bind') or made permanent (`genie-spell-keep')."
               :region (when (use-region-p)
                         (cons (copy-marker (region-beginning))
                               (copy-marker (region-end))))))
-  (genie--submit
+  (genie--conjure
    (genie--spell-prompt
     request
     (format "It runs IMMEDIATELY in the buffer it was asked from — major \
@@ -1162,7 +1073,7 @@ with (interactive \"r\"))"
               "no active region — act at point or on the whole buffer, \
 whichever the request implies")))
    (format "cantrip: %s" request)
-   'cantrip))
+   t))
 
 ;;;###autoload
 (defun genie-cast (&optional pick)
@@ -1246,35 +1157,33 @@ it:\n\n```elisp\n%s\n```" (genie--spell-code genie--spell))))
 
 ;;;###autoload
 (defun genie-chat ()
-  "Open the genie transcript as a multi-turn chat (RET sends)."
+  "Open the chat about this configuration.
+It is a `genie-chat' like any other — skills, past conversations
+\(\\<genie-chat-mode-map>\\[genie-sessions]), the model \
+\(\\[genie-chat-model]) — except that whatever a turn
+changes in the config goes through the wish pipeline."
   (interactive)
-  (genie--ensure-session)
   (pop-to-buffer (genie--buffer))
   (goto-char (point-max)))
 
-(defun genie-send ()
-  "Send the text typed after the chat prompt as the next wish."
-  (interactive)
-  (genie--require-ready)
-  (let ((wish (string-trim (buffer-substring-no-properties
-                            (or genie--input-start (point-min)) (point-max)))))
-    (when (string-empty-p wish) (user-error "Type a wish first"))
-    (genie--submit wish)))
-
 ;;;###autoload
 (defun genie-abort ()
-  "Abort the turn in flight (the session survives when the backend can)."
+  "Stop the turn in flight — a wish, or a spell being conjured."
   (interactive)
-  (if (and (eq genie--state 'thinking) (genie-rpc-live-p genie--rpc))
-      (progn (genie-rpc-abort genie--rpc)
-             (message "🧞 aborting…"))
-    (message "🧞 nothing to abort")))
+  (cond
+   (genie--spell-session
+    (genie-acp-cancel genie--spell-session)
+    (message "🧞 stopping…"))
+   ((and (eq genie--state 'thinking) (get-buffer genie-buffer))
+    (with-current-buffer genie-buffer (genie-chat-abort)))
+   (t (message "🧞 nothing to abort"))))
 
 ;;;###autoload
 (defun genie-quit ()
-  "End the agent session and forget its conversation (config is untouched).
-The next wish starts fresh — also the way to make the agent re-read its
-charter after changing `genie-config-root' or the backend."
+  "End the agents and close the config chat (the config is untouched).
+The next wish starts a new conversation — also the way to make the
+agent re-read its charter after changing `genie-config-root'.  The old
+conversation is not lost: `genie-sessions' in the chat returns to it."
   (interactive)
   (genie--cleanup)
   (message "🧞 session ended — the next wish starts fresh"))

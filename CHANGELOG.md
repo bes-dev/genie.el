@@ -3,6 +3,39 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.13.0] — 2026-11-10
+
+The elmee agent, in full. Pi is gone; everything elmee says over the
+protocol now has a place in Emacs.
+
+- **Pi backend removed**, with the backend registry around it: its
+  one-process-per-task branch was used by neither backend. `genie-rpc.el`
+  is replaced by `genie-acp.el`, a plain ACP client (one process, many
+  sessions), and `genie-backend` and the `genie-pi-*` options are deleted.
+- **Chats for any directory** (`genie-chat.el`): `genie-ask` opens the
+  chat for the current project with the region or file attached. The
+  `*genie*` buffer is now one of these, with the wish pipeline around it.
+- **Past conversations**: `genie-sessions` lists what elmee kept for a
+  directory and returns to any of it; a chat starts a new one with
+  `C-c C-n`.
+- **Skills** are commands in a chat (`/name`, completed with `TAB`).
+- **The agent can ask**: its questions arrive in the minibuffer instead of
+  being cancelled unseen. **Signing in** is `genie-login`.
+- **The model** is switched with `C-c C-m`; the header line shows it, the
+  context in use and the plan.
+- **Tool calls say how they ended**, and why when they failed.
+- **Spells get an agent of their own** — no tools, no history: a cantrip
+  now costs about a kilobyte of prompt.
+- **Fixed: an aborted wish was applied.** A turn that was stopped, hit the
+  step limit or lost its process went on to validation and, without
+  `wish` in `genie-confirm`, was committed half-done. It is now held for
+  review.
+- The transcript grows above the prompt, so a message can be typed while
+  the agent works, and it is read-only.
+
+Requires an elmee recent enough to list sessions with dates and to
+advertise commands after `session/new`.
+
 ## [0.12.0] — 2026-08-25
 
 A simplification pass: the scar tissue of a week of patches removed.

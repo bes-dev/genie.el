@@ -1,11 +1,12 @@
-;;; genie-tests.el --- Tests for genie and genie-rpc -*- lexical-binding: t; -*-
+;;; genie-tests.el --- Tests for genie, genie-chat and genie-acp -*- lexical-binding: t; -*-
 
 ;; Copyright 2026 Sergei Belousov
 ;; SPDX-License-Identifier: Apache-2.0
 
 ;;; Commentary:
 
-;; ERT suite: genie-rpc line framing and event normalization, genie's git
+;; ERT suite: the ACP client (framing, handshake, sessions, questions), the
+;; chat buffer (transcript, skills, the list of conversations), genie's git
 ;; pipeline (snapshot / detect / reject / commit / undo), validation, the
 ;; turn state machine, and the spell/cantrip pipeline with the unified
 ;; undo journal.  No network and no real agent needed.
@@ -23,8 +24,7 @@
   `(let* ((genie-config-root (make-temp-file "genie-tests-repo" t))
           (genie--changed nil) (genie--created nil) (genie--verdict nil)
           (genie--pre nil) (genie--pre-untracked nil) (genie--repairs 0)
-          (genie--wish nil) (genie--journal nil) (genie--state 'idle)
-          (genie--turn 'wish))
+          (genie--wish nil) (genie--journal nil) (genie--state 'idle))
      (unwind-protect
          (progn
            (genie--git "init" "-q")
@@ -43,112 +43,350 @@
     (insert-file-contents (expand-file-name name (genie--root)))
     (buffer-string)))
 
-(defun genie-tests--rpc (backend &rest handlers)
-  "Return a fake `genie-rpc-session' for BACKEND with HANDLERS attached."
-  (apply #'genie-rpc-open backend '("true") handlers))
+(defmacro genie-tests--with-agent (agent sent &rest body)
+  "Run BODY with AGENT bound to an agent whose wire is captured in SENT.
+No process is started: what would be written to it is pushed onto SENT,
+newest first, and `genie-tests--say' plays the agent's side."
+  (declare (indent 2))
+  `(let ((,agent (genie-acp-agent '("true"))) (,sent nil))
+     (cl-letf (((symbol-function 'genie-acp--start)
+                (lambda (agent)
+                  (setf (genie-acp-agent-ready agent) 'greeting
+                        (genie-acp-agent-next-id agent) 0)
+                  (genie-acp--request
+                   agent "initialize" nil
+                   (lambda (result _err)
+                     (setf (genie-acp-agent-auth-methods agent)
+                           (append (plist-get result :authMethods) nil)
+                           (genie-acp-agent-ready agent) t)
+                     (mapc #'funcall
+                           (prog1 (nreverse (genie-acp-agent-waiting agent))
+                             (setf (genie-acp-agent-waiting agent) nil)))))))
+               ((symbol-function 'genie-acp-live-p)
+                (lambda (agent) (genie-acp-agent-ready agent)))
+               ((symbol-function 'genie-acp--send)
+                (lambda (_agent message) (push message ,sent))))
+       ,@body)))
 
-;;;; genie-rpc: framing and event normalization
+(defun genie-tests--say (agent &rest messages)
+  "Feed MESSAGES, plists, to AGENT as lines the agent process wrote."
+  (dolist (message messages)
+    (genie-acp--filter agent (concat (json-serialize message) "\n"))))
 
-(ert-deftest genie-rpc-line-framing ()
-  "JSON lines split across arbitrary chunks are reassembled."
-  (let* ((texts nil)
-         (rpc (genie-tests--rpc 'pi :on-text (lambda (s) (push s texts))))
-         (line (concat "{\"type\":\"message_update\",\"assistantMessageEvent\":"
-                       "{\"type\":\"text_delta\",\"delta\":\"hello\"}}\n")))
-    (genie-rpc--filter rpc (substring line 0 40))
-    (genie-rpc--filter rpc (substring line 40 55))
-    (genie-rpc--filter rpc (substring line 55))
-    (genie-rpc--filter rpc line)
-    (should (equal (nreverse texts) '("hello" "hello")))))
+(defun genie-tests--answer (agent id result)
+  "Answer request ID of AGENT with RESULT."
+  (genie-tests--say agent (list :jsonrpc "2.0" :id id :result result)))
 
-(ert-deftest genie-rpc-pi-events ()
-  "Pi events normalize to on-text / on-tool / on-done."
-  (let* ((log nil)
-         (rpc (genie-tests--rpc
-               'pi
-               :on-text (lambda (s) (push (cons 'text s) log))
-               :on-tool (lambda (s) (push (cons 'tool s) log))
-               :on-done (lambda (a) (push (cons 'done a) log)))))
-    (genie-rpc--filter
-     rpc (concat "{\"type\":\"tool_execution_start\",\"toolName\":\"edit\"}\n"
-                 "{\"type\":\"message_update\",\"assistantMessageEvent\":"
-                 "{\"type\":\"text_delta\",\"delta\":\"ok\"}}\n"
-                 "{\"type\":\"agent_end\"}\n"))
-    (should (equal (nreverse log)
-                   '((tool . "edit") (text . "ok") (done . nil))))))
+(defun genie-tests--update (agent session &rest update)
+  "Send AGENT a `session/update' for SESSION carrying UPDATE."
+  (genie-tests--say agent (list :jsonrpc "2.0" :method "session/update"
+                                :params (list :sessionId session
+                                              :update update))))
 
-(ert-deftest genie-rpc-acp-handshake-and-turn ()
-  "The full ACP cycle: handshake, queued prompt, streaming, stop reason."
-  (let* ((log nil) (sent nil)
-         (rpc (genie-tests--rpc
-               'elmee
-               :on-text (lambda (s) (push (cons 'text s) log))
-               :on-tool (lambda (s) (push (cons 'tool s) log))
-               :on-done (lambda (a) (push (cons 'done a) log))
-               :on-fail (lambda (m) (push (cons 'fail m) log)))))
-    (cl-letf (((symbol-function 'genie-rpc--send)
-               (lambda (_rpc msg) (push msg sent))))
-      ;; a prompt before the session is open waits in the queue
-      (genie-rpc--acp-prompt rpc "make it so")
-      (should (equal (genie-rpc-session-queue rpc) '("make it so")))
-      (genie-rpc--acp-hello rpc)
-      (let ((init (car (last sent))))
-        (should (equal (plist-get init :method) "initialize")))
-      ;; initialize answered → session/new goes out
-      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}\n")
-      (let ((new (car (last sent 1))))
-        (should (equal (plist-get (car sent) :method) "session/new"))
-        (should (stringp (plist-get (plist-get (car sent) :params) :cwd)))
-        (ignore new))
-      ;; session opened → the queued prompt is flushed with the sessionId
-      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"/tmp/s.jsonl\"}}\n")
-      (let ((prompt (car sent)))
-        (should (equal (plist-get prompt :method) "session/prompt"))
-        (should (equal (plist-get (plist-get prompt :params) :sessionId)
-                       "/tmp/s.jsonl"))
-        (should (equal (plist-get (aref (plist-get (plist-get prompt :params)
-                                                   :prompt)
-                                        0)
-                        :text)
+;;;; genie-acp: the protocol
+
+(ert-deftest genie-acp-line-framing ()
+  "JSON lines split across arbitrary chunks are reassembled, UTF-8 and all."
+  (genie-tests--with-agent agent _sent
+    (let* ((texts nil)
+           (session (genie-acp-open agent "/tmp"
+                                    :on-text (lambda (s) (push s texts))))
+           (line (concat (json-serialize
+                          '(:jsonrpc "2.0" :method "session/update"
+                            :params (:sessionId "s"
+                                     :update (:sessionUpdate "agent_message_chunk"
+                                              :content (:type "text"
+                                                        :text "привет")))))
+                         "\n")))
+      (push (cons "s" session) (genie-acp-agent-sessions agent))
+      (genie-acp--filter agent (substring line 0 40))
+      (genie-acp--filter agent (substring line 40 55))
+      (genie-acp--filter agent (substring line 55))
+      (genie-acp--filter agent line)
+      (should (equal texts '("привет" "привет"))))))
+
+(ert-deftest genie-acp-handshake-and-turn ()
+  "The whole cycle: greeting, a session, a queued prompt, a streamed turn."
+  (genie-tests--with-agent agent sent
+    (let* ((log nil)
+           (session
+            (genie-acp-open
+             agent "/tmp/project/"
+             :on-text (lambda (s) (push (cons 'text s) log))
+             :on-tool (lambda (call) (push (cons 'tool (plist-get call :title)) log))
+             :on-tool-update (lambda (call)
+                               (push (cons 'ended (plist-get call :status)) log))
+             :on-plan (lambda (entries) (push (cons 'plan (length entries)) log))
+             :on-usage (lambda (used size) (push (list 'usage used size) log))
+             :on-commands (lambda (commands) (push (cons 'commands commands) log))
+             :on-options (lambda (options)
+                           (push (cons 'options (length options)) log))
+             :on-done (lambda (stop) (push (cons 'done stop) log)))))
+      ;; nothing is started until the first prompt, which then waits
+      (should-not sent)
+      (genie-acp-prompt session "make it so")
+      (should (equal (plist-get (car sent) :method) "initialize"))
+      (genie-tests--answer agent 1 '(:protocolVersion 1))
+      (should (equal (plist-get (car sent) :method) "session/new"))
+      (should (equal (plist-get (plist-get (car sent) :params) :cwd)
+                     "/tmp/project"))
+      (genie-tests--answer
+       agent 2 '(:sessionId "/s.jsonl"
+                 :configOptions [(:id "model" :currentValue "m1")]))
+      ;; the session is open: the queued prompt goes out under its id
+      (let ((params (plist-get (car sent) :params)))
+        (should (equal (plist-get (car sent) :method) "session/prompt"))
+        (should (equal (plist-get params :sessionId) "/s.jsonl"))
+        (should (equal (plist-get (aref (plist-get params :prompt) 0) :text)
                        "make it so")))
-      ;; the turn streams as session/update notifications
-      (genie-rpc--filter
-       rpc (concat "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
-                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
-                   "{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"1\",\"title\":\"apply_patch init.el\"}}}\n"
-                   "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
-                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
-                   "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"done\"}}}}\n"
-                   "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":"
-                   "{\"sessionId\":\"/tmp/s.jsonl\",\"update\":"
-                   "{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[]}}}\n"))
-      ;; the response to session/prompt ends the turn
-      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n")
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "available_commands_update"
+                           :availableCommands [(:name "pdf" :description "read PDFs")])
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "plan"
+                           :entries [(:content "a" :status "pending")])
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "tool_call"
+                           :toolCallId "1" :title "apply_patch init.el")
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "tool_call_update"
+                           :toolCallId "1" :status "completed")
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "agent_message_chunk"
+                           :content '(:type "text" :text "done"))
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "usage_update"
+                           :used 100 :size 1000)
+      ;; an update for a session nobody here holds is dropped, not an error
+      (genie-tests--update agent "/other.jsonl" :sessionUpdate "agent_message_chunk"
+                           :content '(:type "text" :text "not ours"))
+      (genie-tests--answer agent 3 '(:stopReason "end_turn"))
       (should (equal (nreverse log)
-                     '((tool . "apply_patch init.el") (text . "done")
-                       (done . nil))))
-      ;; a request from the agent is declined without stalling the turn
-      (genie-rpc--filter rpc "{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"elicitation/create\",\"params\":{}}\n")
-      (let ((reply (car sent)))
-        (should (equal (plist-get reply :id) "srv-1"))
-        (should (equal (plist-get (plist-get reply :result) :action)
-                       "cancel"))))))
+                     '((options . 1) (commands ("pdf" . "read PDFs")) (plan . 1)
+                       (tool . "apply_patch init.el") (ended . "completed")
+                       (text . "done") (usage 100 1000) (done . "end_turn")))))))
 
-(ert-deftest genie-rpc-acp-prompt-refused ()
-  "A JSON-RPC error answering session/prompt fires on-fail."
-  (let* ((log nil)
-         (rpc (genie-tests--rpc
-               'elmee :on-fail (lambda (m) (push m log)))))
-    (cl-letf (((symbol-function 'genie-rpc--send) #'ignore))
-      (setf (genie-rpc-session-session-id rpc) "/tmp/s.jsonl")
-      (genie-rpc--acp-send-prompt rpc "hi"))
-    (genie-rpc--filter
-     rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600,\"message\":\"this session is already prompting\"}}\n")
-    (should (equal log '("this session is already prompting")))))
+(ert-deftest genie-acp-refusals-carry-their-code ()
+  "A refused prompt reaches `:on-fail' with its code — which is how
+\"sign in first\" is told from any other failure."
+  (genie-tests--with-agent agent _sent
+    (let* ((failed nil)
+           (session (genie-acp-open agent "/tmp"
+                                    :on-fail (lambda (message code)
+                                               (setq failed (cons message code))))))
+      (genie-acp-prompt session "hi")
+      (genie-tests--answer agent 1 nil)
+      (genie-tests--answer agent 2 '(:sessionId "s"))
+      (genie-tests--say agent '(:jsonrpc "2.0" :id 3
+                                :error (:code -32000 :message "sign-in required")))
+      (should (equal failed (cons "sign-in required" genie-acp-auth-required))))))
 
-(ert-deftest genie-rpc-unknown-backend ()
-  "Opening an unregistered backend signals an error."
-  (should-error (genie-rpc-open 'nope '("true"))))
+(ert-deftest genie-acp-resume-is-findable-before-it-answers ()
+  "A resumed conversation is played back before `session/load' is answered."
+  (genie-tests--with-agent agent sent
+    (let* ((said nil)
+           (session (genie-acp-open agent "/tmp" :resume "/old.jsonl"
+                                    :on-user (lambda (text) (push text said)))))
+      (genie-acp-ensure session #'ignore)
+      (genie-tests--answer agent 1 nil)
+      (should (equal (plist-get (car sent) :method) "session/load"))
+      (should (equal (plist-get (plist-get (car sent) :params) :sessionId)
+                     "/old.jsonl"))
+      (genie-tests--update agent "/old.jsonl" :sessionUpdate "user_message_chunk"
+                           :content '(:type "text" :text "earlier"))
+      (should (equal said '("earlier")))
+      (genie-tests--answer agent 2 nil)
+      (should (eq (genie-acp-session-state session) t)))))
+
+(ert-deftest genie-acp-a-dead-agent-is-reopened-where-it-left-off ()
+  "After the process dies a session reopens its conversation, unreplayed."
+  (genie-tests--with-agent agent sent
+    (let* ((exited nil)
+           (session (genie-acp-open agent "/tmp"
+                                    :on-exit (lambda () (setq exited t)))))
+      (genie-acp-ensure session #'ignore)
+      (genie-tests--answer agent 1 nil)
+      (genie-tests--answer agent 2 '(:sessionId "/s.jsonl"))
+      (let ((proc (start-process "genie-tests-true" nil "true")))
+        (setf (genie-acp-agent-proc agent) proc)
+        (while (process-live-p proc) (accept-process-output proc 0.1))
+        (genie-acp--sentinel agent proc))
+      (should exited)
+      (should-not (genie-acp-session-state session))
+      (genie-acp-prompt session "still there?")
+      (genie-tests--answer agent 1 nil)
+      (should (equal (plist-get (car sent) :method) "session/resume"))
+      (should (equal (plist-get (plist-get (car sent) :params) :sessionId)
+                     "/s.jsonl")))))
+
+(ert-deftest genie-acp-questions-are-answered-or-declined ()
+  "A question goes to the session it names; with nobody to ask it is cancelled."
+  (genie-tests--with-agent agent sent
+    (let* ((session (genie-acp-open
+                     agent "/tmp"
+                     :on-ask (lambda (_params reply)
+                               (funcall reply '(:q0 "This file")))))
+           (ask (lambda (id scope)
+                  (genie-tests--say
+                   agent
+                   (list :jsonrpc "2.0" :id id :method "elicitation/create"
+                         :params (list :mode (list :form (list :scope scope))))))))
+      (push (cons "s" session) (genie-acp-agent-sessions agent))
+      (funcall ask "q-1" '(:sessionId "s"))
+      (should (equal (plist-get (car sent) :id) "q-1"))
+      (should (equal (plist-get (car sent) :result)
+                     '(:action "accept" :content (:q0 "This file"))))
+      (funcall ask "q-2" '(:sessionId "nobody"))
+      (should (equal (plist-get (plist-get (car sent) :result) :action) "cancel"))
+      ;; anything else the agent asks for was never offered
+      (genie-tests--say agent '(:jsonrpc "2.0" :id "f-1" :method "fs/read_text_file"))
+      (should (= (plist-get (plist-get (car sent) :error) :code) -32601)))))
+
+;;;; genie-chat: the buffer
+
+(defmacro genie-tests--with-chat (&rest body)
+  "Run BODY in a fresh chat buffer about a throwaway directory."
+  (declare (indent 0))
+  `(let* ((directory (make-temp-file "genie-tests-chat" t))
+          (chat (genie-chat-open directory :name " *genie-tests-chat*")))
+     (unwind-protect
+         (with-current-buffer chat ,@body)
+       (kill-buffer chat)
+       (delete-directory directory t))))
+
+(ert-deftest genie-chat-transcript-grows-above-what-is-being-typed ()
+  "Output lands above the prompt, so a half-typed message is left alone."
+  (genie-tests--with-chat
+    (goto-char (point-max))
+    (insert "half a thought")
+    (genie-chat--on-user "first")
+    (setq genie-chat--busy t)
+    (genie-chat--on-text "an ")
+    (genie-chat--on-text "answer")
+    (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
+                   "half a thought"))
+    (should (string-match-p "❯ first\n\nan answer\n❯ half a thought\\'"
+                            (buffer-string)))
+    ;; the transcript cannot be typed into; the message can
+    (should-error (progn (goto-char (point-min)) (insert "x")))
+    (goto-char (point-max))
+    (insert "!")))
+
+(ert-deftest genie-chat-tool-lines-say-how-they-ended ()
+  "A tool call is one line, marked when it ends, with the reason if it failed."
+  (genie-tests--with-chat
+    (genie-chat--on-tool '(:toolCallId "1" :title "read init.el"))
+    (genie-chat--on-tool '(:toolCallId "2" :title "exec make"))
+    (genie-chat--on-tool-update '(:toolCallId "1" :status "completed"))
+    (genie-chat--on-tool-update
+     '(:toolCallId "2" :status "failed"
+       :content [(:type "content"
+                  :content (:type "text" :text "make: *** no rule\n[exit status: 2]"))]))
+    (should (string-match-p "✓ read init.el\n✗ exec make\n  make: \\*\\*\\* no rule\n"
+                            (buffer-string)))))
+
+(ert-deftest genie-chat-dresses-links-and-leaves-the-words ()
+  "A path that exists and a wikilink become buttons; nothing is rewritten."
+  (genie-tests--with-chat
+    (let* ((file (expand-file-name "notes.md" directory))
+           (said (format "See %s:3 and [[notes]], not /no/such/file; \
+docs at https://example.com/docs." file)))
+      (with-temp-file file (insert "a\nb\nc\n"))
+      (genie-chat--insert said)
+      (genie-chat--dress (point-min) genie-chat--tail)
+      (goto-char (point-min))
+      (should (search-forward said nil t))
+      (goto-char (match-beginning 0))
+      (search-forward "notes.md")
+      (should (equal (button-get (button-at (1- (point))) 'file) file))
+      (should (= (button-get (button-at (1- (point))) 'line) 3))
+      (search-forward "[[notes")
+      (should (equal (button-get (button-at (point)) 'page) "notes"))
+      (search-forward "/no/such")
+      (should-not (button-at (point)))
+      (search-forward "example.com")
+      (should (equal (button-get (button-at (point)) 'url)
+                     "https://example.com/docs"))
+      (let ((genie-chat-wiki-roots (list directory)))
+        (cl-letf (((symbol-function 'find-file-other-window)
+                   (lambda (found) (should (equal found file)))))
+          (genie-chat--open-page "notes"))))))
+
+(ert-deftest genie-chat-a-turn-carries-what-was-attached ()
+  "What `genie-ask' attached goes with the next message, once."
+  (genie-tests--with-chat
+    (let (sent)
+      (cl-letf (((symbol-function 'genie-acp-prompt)
+                 (lambda (_session blocks) (setq sent blocks))))
+        (push (cons "init.el:1-2" '(:type "resource" :resource (:text "x")))
+              genie-chat--attached)
+        (genie-chat-submit (current-buffer) "explain this")
+        (should (equal (mapcar (lambda (block) (plist-get block :type)) sent)
+                       '("resource" "text")))
+        (should-not genie-chat--attached)
+        (should (string-match-p "❯ explain this\n\n📎 init.el:1-2" (buffer-string)))
+        ;; a second message while that one runs is refused, not queued
+        (should-error (genie-chat-submit (current-buffer) "and this")
+                      :type 'user-error)))))
+
+(ert-deftest genie-chat-earlier-messages-come-back-to-be-sent-again ()
+  "M-p walks back through what was said here; M-n returns to the blank."
+  (genie-tests--with-chat
+    (genie-chat--on-user "first")
+    (genie-chat--on-user "second")
+    (cl-flet ((typed () (buffer-substring-no-properties genie-chat--input
+                                                        (point-max))))
+      (genie-chat-earlier)
+      (should (equal (typed) "second"))
+      (genie-chat-earlier)
+      (should (equal (typed) "first"))
+      (should-error (genie-chat-earlier) :type 'user-error)
+      (genie-chat-later)
+      (should (equal (typed) "second"))
+      (genie-chat-later)
+      (should (equal (typed) "")))))
+
+(ert-deftest genie-chat-a-skill-name-completes-at-the-start-of-a-message ()
+  "`/name' is completed from what the agent offers, and only up front."
+  (genie-tests--with-chat
+    (setq genie-chat--commands '(("pdf" . "read PDFs") ("goal" . "set a goal")))
+    (goto-char (point-max))
+    (insert "/pd")
+    (pcase-let ((`(,beg ,end ,table . ,_) (genie-chat--complete-skill)))
+      (should (equal (buffer-substring beg end) "pd"))
+      (should (equal (all-completions "pd" table) '("pdf"))))
+    (insert "f some.pdf")
+    (should-not (genie-chat--complete-skill))))
+
+(ert-deftest genie-chat-questions-go-to-the-minibuffer ()
+  "Each field of the agent's question is asked; quitting declines them all."
+  (genie-tests--with-chat
+    (let* ((answers 'unanswered)
+           (params '(:mode (:form (:requestedSchema
+                                   (:properties
+                                    (:q0 (:title "Scope" :description "How far?"
+                                          :enum ["This file" "Whole crate"])
+                                     :q1 (:title "Tests" :enum ["yes" "no"])))))))
+           (reply (lambda (given) (setq answers given))))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function) (funcall function)))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _) (cadr choices))))
+        (genie-chat--on-ask params reply))
+      (should (equal answers '(:q0 "Whole crate" :q1 "no")))
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function) (funcall function)))
+                ((symbol-function 'completing-read)
+                 (lambda (&rest _) (signal 'quit nil))))
+        (genie-chat--on-ask params reply))
+      (should-not answers))))
+
+(ert-deftest genie-sessions-say-how-long-ago ()
+  "The list tells age the way a person would, and survives a missing date."
+  (let ((ago (lambda (seconds)
+               (genie-sessions--ago
+                (format-time-string "%FT%TZ" (time-subtract nil seconds) t)))))
+    (should (equal (funcall ago 5) "just now"))
+    (should (equal (funcall ago 600) "10 min ago"))
+    (should (equal (funcall ago 7200) "2 h ago"))
+    (should (equal (funcall ago 259200) "3 d ago"))
+    (should (equal (genie-sessions--ago nil) ""))))
+
+;;;; genie: git pipeline
 
 ;;;; genie: git pipeline
 
@@ -384,10 +622,9 @@ no healing: the form calls whatever `genie--activity' is current."
 
 (ert-deftest genie-instant-wish-skips-the-review ()
   "Without `wish' confirmation a validated change applies straight away."
-  (let ((genie-confirm nil) (genie--state 'thinking) (genie--turn 'wish)
+  (let ((genie-confirm nil) (genie--state 'thinking)
         (genie--changed '("a.el")) applied shown)
     (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
-              ((symbol-function 'genie--insert-prompt) #'ignore)
               ((symbol-function 'genie--validate)
                (lambda (cb) (funcall cb '(t . "ok"))))
               ((symbol-function 'genie-apply) (lambda () (setq applied t)))
@@ -400,10 +637,9 @@ no healing: the form calls whatever `genie--activity' is current."
   "Run a wish turn whose validation fails, with the outcomes recorded.
 BODY sees `applied', `shown', `repaired' and `gave-up'."
   (declare (indent 0))
-  `(let ((genie--state 'thinking) (genie--turn 'wish)
+  `(let ((genie--state 'thinking)
          (genie--changed '("a.el")) applied shown repaired gave-up)
      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
-               ((symbol-function 'genie--insert-prompt) #'ignore)
                ((symbol-function 'genie--validate)
                 (lambda (cb) (funcall cb '(nil . "void-function foo"))))
                ((symbol-function 'genie-apply) (lambda () (setq applied t)))
@@ -469,18 +705,60 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
     (genie--git "commit" "-qm" "base")
     (let ((genie--state 'idle) (genie--changed nil) (genie--wish nil)
           (genie--repairs 0) sent)
-      (cl-letf (((symbol-function 'genie--ensure-session) #'ignore)
-                ((symbol-function 'genie-rpc-prompt)
-                 (lambda (_rpc text) (setq sent text)))
+      (cl-letf (((symbol-function 'genie-acp-prompt)
+                 (lambda (_session blocks)
+                   (setq sent (plist-get (car (last blocks)) :text))))
                 ((symbol-function 'genie--install-indicator) #'ignore))
-        (genie--submit "add a keybinding")
-        (should (equal genie--wish "add a keybinding"))
-        (setq genie--changed '("a.el"))      ; a change is now pending
-        (genie--set-state 'reviewing)
-        (genie--repair '(nil . "void-function foo"))
-        (should (equal genie--wish "add a keybinding"))   ; unchanged
-        (should (string-match-p "void-function foo" sent))
-        (should (= genie--repairs 1))))))
+        (unwind-protect
+            (progn
+              (genie--submit "add a keybinding")
+              (should (equal genie--wish "add a keybinding"))
+              (should (eq genie--state 'thinking))
+              ;; the turn ends with a change pending, which fails to load
+              (with-current-buffer (genie--buffer) (setq genie-chat--busy nil))
+              (setq genie--changed '("a.el"))
+              (genie--set-state 'reviewing)
+              (genie--repair '(nil . "void-function foo"))
+              (should (equal genie--wish "add a keybinding")) ; unchanged
+              (should (string-match-p "void-function foo" sent))
+              (should (= genie--repairs 1)))
+          (kill-buffer (genie--buffer))
+          (genie--set-state 'idle))))))
+
+(ert-deftest genie-a-turn-typed-into-the-chat-is-a-wish-too ()
+  "RET in the config chat opens the same pipeline `M-x genie' does."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (cl-letf (((symbol-function 'genie-acp-prompt) #'ignore)
+              ((symbol-function 'genie--install-indicator) #'ignore))
+      (unwind-protect
+          (with-current-buffer (genie--buffer)
+            (goto-char (point-max))
+            (insert "bind C-c f")
+            (genie-chat-send)
+            (should (equal genie--wish "bind C-c f"))
+            (should (eq genie--state 'thinking))
+            (should genie--pre))
+        (kill-buffer (genie--buffer))
+        (genie--set-state 'idle)))))
+
+(ert-deftest genie-a-turn-that-did-not-finish-is-held-not-applied ()
+  "Stopped mid-edit, what the agent left is neither committed nor discarded."
+  (dolist (stop '("cancelled" "max_turn_requests" failed exited))
+    (let ((genie-confirm nil) (genie--state 'thinking)
+          (genie--changed '("a.el")) (genie--verdict '(t . "stale")) touched)
+      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
+                ((symbol-function 'genie--validate)
+                 (lambda (_) (setq touched 'validated)))
+                ((symbol-function 'genie-apply) (lambda () (setq touched 'applied)))
+                ((symbol-function 'genie--restore-worktree)
+                 (lambda () (setq touched 'restored))))
+        (genie--finish-turn stop))
+      (should-not touched)
+      (should (eq genie--state 'reviewing))
+      (should-not genie--verdict))))
 
 (ert-deftest genie-instant-undo-skips-the-prompt ()
   "Without `undo' confirmation the commit is dropped without asking…"
@@ -566,15 +844,44 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
     (should (eq genie--spell 'sentinel))        ; nothing armed
     (should-not (fboundp 'genie-spell/evil))))  ; nothing evaluated
 
+(defvar genie-tests--conjuring nil "Handlers of the conjuring under test.")
+
+(defmacro genie-tests--conjuring (&rest body)
+  "Run BODY with the spell agent replaced by a recording of what it is asked.
+`genie-tests--conjured' then answers as the agent would."
+  (declare (indent 0))
+  `(let ((genie--spell-agent nil) (genie--spell-session nil)
+         (genie-tests--conjuring nil))
+     (cl-letf (((symbol-function 'genie-acp-open)
+                (lambda (agent _directory &rest handlers)
+                  (setq genie-tests--conjuring (cons agent handlers))
+                  'session))
+               ((symbol-function 'genie-acp-prompt) #'ignore)
+               ((symbol-function 'genie-acp-close) #'ignore)
+               ((symbol-function 'genie--install-indicator) #'ignore)
+               ((symbol-function 'genie--emit) #'ignore))
+       ,@body)))
+
+(defun genie-tests--spell-argv ()
+  "Return the part of the spell agent's argv that strips it of tools."
+  (let ((argv (genie-acp-agent-command (car genie-tests--conjuring))))
+    (cl-subseq (member "--tools" argv) 0 2)))
+
+(defun genie-tests--conjured (answer)
+  "Deliver ANSWER as the spell agent's whole reply, and end its turn."
+  (funcall (plist-get (cdr genie-tests--conjuring) :on-text) answer)
+  (funcall (plist-get (cdr genie-tests--conjuring) :on-done) "end_turn"))
+
 (ert-deftest genie-spell-pipeline ()
   "A full spell turn arms a working region command; a bad reply keeps it."
-  (let ((genie--turn 'spell)
-        (genie--spell nil) (genie--spells nil)
-        (genie--state 'thinking) (genie--changed nil)
+  (let ((genie--spell nil) (genie--spells nil)
+        (genie--state 'idle) (genie--changed nil)
         (genie--pending-register nil) (genie--journal nil))
-    (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
-              ((symbol-function 'genie--insert-prompt) #'ignore))
-      (setq genie--answer
+    (genie-tests--conjuring
+      (genie--conjure "number the lines" "spell: number the lines")
+      (should (eq genie--state 'thinking))
+      (should (equal (genie-tests--spell-argv) '("--tools" "")))
+      (genie-tests--conjured
             (concat "```elisp\n"
                     "(defun genie-spell/number-lines (beg end)\n"
                     "  \"Number the lines of the region.\"\n"
@@ -585,8 +892,7 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
                     "      (while (< (point) endm)\n"
                     "        (insert (format \"%d. \" (setq n (1+ n))))\n"
                     "        (forward-line 1)))))\n"
-                    "```"))
-      (genie--finish-turn))
+                    "```")))
     (should (eq (genie--spell-name genie--spell) 'genie-spell/number-lines))
     (should (eq genie--state 'idle))
     (with-temp-buffer
@@ -704,9 +1010,8 @@ The effect is gone with the revert; undo must not error or strand it."
 
 (ert-deftest genie-cantrip-pipeline ()
   "A cantrip turn executes immediately on the captured region and is undoable."
-  (let ((genie--turn 'cantrip)
-        (genie--spell nil) (genie--spells nil)
-        (genie--state 'thinking) (genie--changed nil) (genie--journal nil)
+  (let ((genie--spell nil) (genie--spells nil)
+        (genie--state 'idle) (genie--changed nil) (genie--journal nil)
         (genie--pending-register nil))
     (with-temp-buffer
       (buffer-enable-undo)
@@ -716,16 +1021,15 @@ The effect is gone with the revert; undo must not error or strand it."
             (list :buffer (current-buffer) :point (point-marker)
                   :region (cons (copy-marker (point-min))
                                 (copy-marker (point-max)))))
-      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
-                ((symbol-function 'genie--insert-prompt) #'ignore))
-        (setq genie--answer
-              (concat "```elisp\n"
-                      "(defun genie-spell/upcase-it (beg end)\n"
-                      "  \"Upcase the region.\"\n"
-                      "  (interactive \"r\")\n"
-                      "  (upcase-region beg end))\n"
-                      "```"))
-        (genie--finish-turn))
+      (genie-tests--conjuring
+        (genie--conjure "upcase it" "cantrip: upcase it" t)
+        (genie-tests--conjured
+         (concat "```elisp\n"
+                 "(defun genie-spell/upcase-it (beg end)\n"
+                 "  \"Upcase the region.\"\n"
+                 "  (interactive \"r\")\n"
+                 "  (upcase-region beg end))\n"
+                 "```")))
       (should (equal (buffer-string) "ALPHA\nBETA\n"))
       (should (eq (genie--spell-name genie--spell) 'genie-spell/upcase-it))
       (should (eq (caar genie--journal) 'cast))
