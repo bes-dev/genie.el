@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.13.0
+;; Version: 0.14.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -53,6 +53,11 @@
 ;;   :on-commands LIST      what `/name' may be typed: (NAME . DESCRIPTION)
 ;;   :on-options OPTIONS    what can be chosen for the session (the model)
 ;;   :on-title TITLE        what the conversation is about
+;;   :on-notice SEVERITY TITLE  something to know that is not the conversation
+;;   :on-compaction STATUS  the context being summarized: "in_progress",
+;;                          then "completed" or "failed"
+;;   :on-child ID TITLE STATE   an agent this one started: "running", "idle"
+;;   :on-child-tool TITLE CALL  a tool call of such a child
 ;;   :on-ask PARAMS REPLY   the agent asks a question; call REPLY with a
 ;;                          plist of answers, or nil to decline
 ;;   :on-done STOP-REASON   the turn ended ("end_turn", "cancelled", ...)
@@ -73,6 +78,9 @@
   waiting
   ;; Open sessions, as (ID . SESSION).
   sessions
+  ;; Agents a session started, as (ID SESSION . TITLE): each speaks under an
+  ;; id of its own, and what it says belongs to the session that started it.
+  children
   ;; The ways to sign in this agent offered, as the handshake listed them.
   auth-methods)
 
@@ -146,9 +154,12 @@ at startup has a readable reason."
      agent "initialize"
      ;; Saying a form can be shown is what lets the agent ask a question
      ;; instead of guessing: without it every question is cancelled unasked.
+     ;; The rest is what else may be sent: none of it arrives unasked.
      '(:protocolVersion 1
-       :clientCapabilities (:elicitation (:form nil))
-       :clientInfo (:name "genie.el" :version "0.13.0"))
+       :clientCapabilities (:elicitation (:form nil)
+                            :session (:compaction nil :notices nil)
+                            :subagents nil)
+       :clientInfo (:name "genie.el" :version "0.14.0"))
      (lambda (result err)
        (if err
            (genie-acp--fail-all agent (genie-acp--reason err "initialize refused"))
@@ -176,6 +187,7 @@ reopens it — without replaying it — the next time it is used."
     (let ((sessions (mapcar #'cdr (genie-acp-agent-sessions agent))))
       (setf (genie-acp-agent-ready agent) nil
             (genie-acp-agent-waiting agent) nil
+            (genie-acp-agent-children agent) nil
             (genie-acp-agent-sessions agent) nil)
       (dolist (session sessions)
         (setf (genie-acp-session-resume session) (genie-acp-session-id session)
@@ -238,8 +250,15 @@ the agent asks for is declined, since nothing else was offered."
         (funcall (cdr cell)
                  (plist-get message :result) (plist-get message :error))))
      ((equal method "session/update")
-      (when-let* ((session (genie-acp--session agent (plist-get params :sessionId))))
-        (genie-acp--update session (plist-get params :update))))
+      (let ((id (plist-get params :sessionId))
+            (update (plist-get params :update)))
+        (if-let* ((session (genie-acp--session agent id)))
+            (genie-acp--update session update)
+          ;; Not a session held here: perhaps a child of one, whose tool
+          ;; calls are the part of its work worth watching.
+          (when-let* ((child (cdr (assoc id (genie-acp-agent-children agent)))))
+            (when (equal (plist-get update :sessionUpdate) "tool_call")
+              (genie-acp--fire (car child) :on-child-tool (cdr child) update))))))
      ((and id (equal method "elicitation/create"))
       (genie-acp--ask agent id params))
      (id
@@ -294,7 +313,30 @@ the agent takes as \"decide for yourself\", not as a failure."
        (genie-acp--fire session :on-options
                         (append (plist-get update :configOptions) nil)))
       ("session_info_update"
-       (genie-acp--fire session :on-title (plist-get update :title))))))
+       (genie-acp--fire session :on-title (plist-get update :title)))
+      ("notice"
+       (genie-acp--fire session :on-notice
+                        (plist-get update :severity) (plist-get update :title)))
+      ("compaction_summary_chunk"
+       (genie-acp--fire session :on-compaction "in_progress"))
+      ("compaction_update"
+       (genie-acp--fire session :on-compaction (plist-get update :status)))
+      ("subagent_update" (genie-acp--child session update)))))
+
+(defun genie-acp--child (session update)
+  "Record the agent SESSION started that UPDATE is about, and tell SESSION.
+The child is remembered for as long as it works, so that what it says
+under its own id finds the session it belongs to."
+  (let* ((agent (genie-acp-session-agent session))
+         (id (plist-get update :sessionId))
+         (state (plist-get (plist-get update :state) :state))
+         (known (assoc id (genie-acp-agent-children agent)))
+         (title (or (plist-get update :title) (cddr known) "agent")))
+    (setf (genie-acp-agent-children agent)
+          (delq known (genie-acp-agent-children agent)))
+    (unless (equal state "idle")
+      (push (cons id (cons session title)) (genie-acp-agent-children agent)))
+    (genie-acp--fire session :on-child id title state)))
 
 (defun genie-acp--fire (session key &rest args)
   "Call the KEY handler of SESSION with ARGS, when one is attached."
@@ -410,18 +452,28 @@ The turn's end arrives at `:on-done' with why it stopped; a refusal at
           (genie-acp-agent-sessions agent)
           (rassq-delete-all session (genie-acp-agent-sessions agent)))))
 
-(defun genie-acp-set (session option value callback)
-  "Choose VALUE for OPTION (such as \"model\") on SESSION.
-CALLBACK gets nil on success, or the reason it was refused."
+(defun genie-acp-call (session method params callback)
+  "Ask METHOD of SESSION with PARAMS, a plist, opening it if need be.
+CALLBACK gets the result and nil, or nil and the reason it was refused.
+This is how the rest of what a session can do is reached: steering a
+turn (`_session/steering'), the conversation as a tree
+\(`_session/history', `_session/rewind', `_session/checkout'), and
+`session/load' to have it said again."
   (genie-acp-ensure
    session
    (lambda ()
      (genie-acp--request
-      (genie-acp-session-agent session) "session/set_config_option"
-      (list :sessionId (genie-acp-session-id session)
-            :configId option :value value)
-      (lambda (_result err)
-        (funcall callback (and err (genie-acp--reason err "refused"))))))))
+      (genie-acp-session-agent session) method
+      (append (list :sessionId (genie-acp-session-id session)) params)
+      (lambda (result err)
+        (funcall callback result (and err (genie-acp--reason err "refused"))))))))
+
+(defun genie-acp-set (session option value callback)
+  "Choose VALUE for OPTION (such as \"model\") on SESSION.
+CALLBACK gets nil on success, or the reason it was refused."
+  (genie-acp-call session "session/set_config_option"
+                  (list :configId option :value value)
+                  (lambda (_result reason) (funcall callback reason))))
 
 ;;;; What an agent can be asked apart from any session
 
@@ -449,15 +501,26 @@ and `:prompts', or nil and a reason."
                    (plist-get result :sessions))
            nil)))))))
 
-(defun genie-acp-delete (agent id callback)
-  "Ask AGENT to delete the conversation ID; CALLBACK gets nil or a reason."
+(defun genie-acp--kept (agent method params callback)
+  "Ask METHOD with PARAMS of AGENT, about a conversation kept on disk.
+CALLBACK gets nil, or the reason it was refused."
   (genie-acp--when-ready
    agent
    (lambda ()
      (genie-acp--request
-      agent "session/delete" (list :sessionId id)
+      agent method params
       (lambda (_result err)
         (funcall callback (and err (genie-acp--reason err "refused"))))))))
+
+(defun genie-acp-delete (agent id callback)
+  "Ask AGENT to delete the conversation ID; CALLBACK gets nil or a reason."
+  (genie-acp--kept agent "session/delete" (list :sessionId id) callback))
+
+(defun genie-acp-rename (agent id title callback)
+  "Ask AGENT to call the conversation ID TITLE, open or not.
+CALLBACK gets nil or a reason."
+  (genie-acp--kept agent "session/set_title"
+                   (list :sessionId id :title title) callback))
 
 (defun genie-acp-sign-in (agent callback)
   "Sign AGENT in by the first way it offered; CALLBACK gets nil or a reason.

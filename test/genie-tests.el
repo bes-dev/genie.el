@@ -375,6 +375,145 @@ docs at https://example.com/docs." file)))
         (genie-chat--on-ask params reply))
       (should-not answers))))
 
+(ert-deftest genie-acp-what-is-not-the-conversation-has-handlers-too ()
+  "Notices, compactions and the agents a session started reach its handlers."
+  (genie-tests--with-agent agent sent
+    (let* ((log nil)
+           (session
+            (genie-acp-open
+             agent "/tmp/project/"
+             :on-notice (lambda (severity title) (push (list severity title) log))
+             :on-compaction (lambda (status) (push status log))
+             :on-child (lambda (id title state) (push (list id title state) log))
+             :on-child-tool (lambda (title call)
+                              (push (list title (plist-get call :title)) log)))))
+      (genie-acp-ensure session #'ignore)
+      (genie-tests--answer agent 1 '(:protocolVersion 1))
+      (genie-tests--answer agent 2 '(:sessionId "/s.jsonl"))
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "notice"
+                           :severity "warning" :title "skipping MCP server x")
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "compaction_summary_chunk"
+                           :compactionId "c" :content '(:type "text" :text "so far"))
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "compaction_update"
+                           :compactionId "c" :status "completed")
+      ;; a child speaks under its own id, and is heard only once announced
+      (genie-tests--update agent "/child.jsonl" :sessionUpdate "tool_call"
+                           :toolCallId "0" :title "too early")
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "subagent_update"
+                           :sessionId "/child.jsonl" :title "helper"
+                           :state '(:state "running"))
+      (genie-tests--update agent "/child.jsonl" :sessionUpdate "tool_call"
+                           :toolCallId "1" :title "exec make")
+      (genie-tests--update agent "/child.jsonl" :sessionUpdate "agent_message_chunk"
+                           :content '(:type "text" :text "its own words"))
+      (genie-tests--update agent "/s.jsonl" :sessionUpdate "subagent_update"
+                           :sessionId "/child.jsonl" :state '(:state "idle"))
+      (should (equal (nreverse log)
+                     '(("warning" "skipping MCP server x")
+                       "in_progress" "completed"
+                       ("/child.jsonl" "helper" "running")
+                       ("helper" "exec make")
+                       ("/child.jsonl" "helper" "idle"))))
+      (should-not (genie-acp-agent-children agent)))))
+
+(ert-deftest genie-acp-call-names-its-session-and-says-why-not ()
+  "Anything else asked of a session carries its id; a refusal is a reason."
+  (genie-tests--with-agent agent sent
+    (let ((session (genie-acp-open agent "/tmp/project/")) got)
+      (genie-acp-call session "_session/rewind" '(:promptId 3)
+                      (lambda (result reason) (push (list result reason) got)))
+      (genie-tests--answer agent 1 '(:protocolVersion 1))
+      (genie-tests--answer agent 2 '(:sessionId "/s.jsonl"))
+      (should (equal (plist-get (car sent) :params)
+                     '(:sessionId "/s.jsonl" :promptId 3)))
+      (genie-tests--answer agent 3 '(:prompt "again"))
+      (genie-acp-rename agent "/old.jsonl" "notes" (lambda (reason) (push reason got)))
+      (should (equal (plist-get (car sent) :method) "session/set_title"))
+      (genie-tests--say agent '(:jsonrpc "2.0" :id 4 :error (:code -32602 :message "no session")))
+      (should (equal got '("no session" ((:prompt "again") nil)))))))
+
+(ert-deftest genie-chat-what-is-typed-during-a-turn-steers-it ()
+  "RET while the agent works corrects the turn in flight instead of waiting."
+  (genie-tests--with-chat
+    (let (called submitted)
+      (cl-letf (((symbol-function 'genie-acp-call)
+                 (lambda (_session method params callback)
+                   (push (list method params) called)
+                   (funcall callback '(:outcome "injected") nil)))
+                ((symbol-function 'genie-acp-prompt)
+                 (lambda (_session blocks) (setq submitted blocks))))
+        (setq genie-chat--busy (current-time))
+        (goto-char (point-max))
+        (insert "not that file")
+        (genie-chat-send)
+        (should (equal (caar called) "_session/steering"))
+        (should (equal (plist-get (aref (plist-get (cadar called) :prompt) 0) :text)
+                       "not that file"))
+        (should (string-match-p "❯ not that file" (buffer-string)))
+        (should (= genie-chat--input (point-max)))
+        (should-not submitted)
+        ;; a turn that ended in the meantime gets it as its next prompt
+        (cl-letf (((symbol-function 'genie-acp-call)
+                   (lambda (_session _method _params callback)
+                     (setq genie-chat--busy nil)
+                     (funcall callback '(:outcome "promptRequired") nil))))
+          (insert "and then this")
+          (genie-chat-send)
+          (should (equal (plist-get (car submitted) :text) "and then this")))))))
+
+(ert-deftest genie-chat-going-back-returns-the-message-to-be-edited ()
+  "A rewind says the conversation again and puts the message after the prompt."
+  (genie-tests--with-chat
+    (let (called)
+      (cl-letf (((symbol-function 'genie-acp-call)
+                 (lambda (_session method params callback)
+                   (push (list method params) called)
+                   (pcase method
+                     ("_session/history"
+                      (funcall callback
+                               '(:prompts [(:id 1 :text "first" :checkpoint t)
+                                           (:id 4 :text "second" :checkpoint t)])
+                               nil))
+                     ("_session/rewind" (funcall callback '(:prompt "second") nil))
+                     ("session/load"
+                      (genie-chat--on-user "first")
+                      (funcall callback nil nil)))))
+                ((symbol-function 'run-at-time)
+                 (lambda (_time _repeat function &rest args) (apply function args)))
+                ((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _) (caar choices)))
+                ((symbol-function 'read-multiple-choice)
+                 (lambda (&rest _) '(?c "conversation"))))
+        (genie-chat--on-user "first")
+        (genie-chat--on-user "second")
+        (genie-chat-rewind)
+        ;; the newest message is offered first, and is the one gone back to
+        (should (equal (cadr (assoc "_session/rewind" called))
+                       '(:promptId 4 :restore "conversation")))
+        (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
+                       "second"))
+        (should (string-match-p "❯ first" (buffer-string)))
+        (should-not (string-match-p "❯ second\n" (buffer-string)))
+        (should (string-match-p "back to before this message" (buffer-string)))))))
+
+(ert-deftest genie-chat-says-what-happens-beside-the-conversation ()
+  "A helper's work, a compaction and a notice are asides in the transcript."
+  (genie-tests--with-chat
+    (genie-chat--on-child "/c.jsonl" "helper" "running")
+    (genie-chat--on-child "/c.jsonl" "helper" "running")
+    (genie-chat--on-child-tool "helper" '(:title "exec make"))
+    (should (string-match-p "1 helping" (genie-chat--header)))
+    (genie-chat--on-child "/c.jsonl" "helper" "idle")
+    (setq genie-chat--busy (current-time))
+    (genie-chat--on-compaction "in_progress")
+    (should (string-match-p "making room" (genie-chat--header)))
+    (genie-chat--on-compaction "completed")
+    (genie-chat--on-notice "warning" "skipping MCP server x")
+    (should-not (string-match-p "helping\\|making room" (genie-chat--header)))
+    (should (string-match-p
+             "⤷ helper started\n  ⤷ helper · exec make\n⤷ helper finished\n— earlier conversation summarized to make room —\n⚠ skipping MCP server x\n"
+             (buffer-string)))))
+
 (ert-deftest genie-sessions-say-how-long-ago ()
   "The list tells age the way a person would, and survives a missing date."
   (let ((ago (lambda (seconds)

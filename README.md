@@ -81,8 +81,15 @@ about your config, with the wish pipeline wrapped around every turn.
 
 In any chat:
 
-- **Type ahead.** Answers stream in above the prompt, so the next message can
-  be written while the agent works. `RET` sends, `C-c C-k` stops the turn.
+- **Type ahead, and steer.** Answers stream in above the prompt, so the next
+  message can be written while the agent works. `RET` sends — and while a
+  turn is in flight it does not wait: what you typed reaches that turn as a
+  correction, taken up at its next step. `C-c C-k` stops the turn.
+- **Go back.** `C-c C-r` rewinds to before any earlier message: the
+  conversation, the files as they were before that message's turn changed
+  them, or both. The message returns after the prompt to be edited and sent
+  again. What followed it is kept as a line of its own, and `C-c C-b`
+  returns to it.
 - **Skills.** Whatever skills the agent has are commands here: `/pdf
   report.pdf`, `/kb что у меня про X`. `TAB` completes the name, `C-c C-/`
   picks one from a list. A skill is a `SKILL.md` — add a capability by
@@ -90,13 +97,19 @@ In any chat:
 - **Past conversations.** `C-c C-s` (or `M-x genie-sessions`) lists the
   conversations kept for the directory — when, how much was asked, what
   about. `RET` returns to one: the chat fills with what was said and goes on
-  from there. `n` starts a new one, `d` deletes. They are elmee's files, so
-  they survive restarts; `C-c C-n` starts afresh without the list.
+  from there. `n` starts a new one, `r` gives one a name of its own, `d`
+  deletes. They are elmee's files, so they survive restarts; `C-c C-n`
+  starts afresh without the list.
 - **The model.** `C-c C-m` switches it mid-conversation. The header line
   shows the model, how full its context is, and the step of the plan the
   agent is on.
 - **Questions.** When the agent needs a decision it asks in the minibuffer,
   with its options as completions.
+- **What happens beside the conversation.** An agent the conversation
+  delegated to shows when it starts, what it runs and when it is done, and
+  the header counts the ones still working. A context being summarized to
+  make room says so, and so does anything that went wrong outside the
+  conversation, such as an MCP server that would not start.
 - **Links.** Paths in an answer open on `RET`/click; `[[wikilinks]]` open
   the page of that name under `genie-chat-wiki-roots`.
 - **Signing in.** A model that needs an account says so; `M-x genie-login`
@@ -260,7 +273,9 @@ an empty `init.el` with nothing but genie in it:
 | `genie` | `C-c g g` | State a wish from the minibuffer |
 | `genie-chat` | `C-c g c` | The chat about this config (RET sends) |
 | `genie-ask` | `C-c g a` | The chat for the current project, with the region or file attached |
-| `genie-sessions` | `C-c C-s` in a chat | Past conversations of a directory: return, start, delete |
+| `genie-sessions` | `C-c C-s` in a chat | Past conversations of a directory: return, start, rename, delete |
+| `genie-chat-rewind` | `C-c C-r` in a chat | Go back to before an earlier message: conversation, files or both |
+| `genie-chat-branches` | `C-c C-b` in a chat | Return to a line of the conversation that going back left behind |
 | `genie-login` | — | Sign the agent in (elmee's browser flow) |
 | `genie-diff` | `C-c g d` | Review the pending diff (`a` apply, `r` reject) |
 | `genie-undo` | `C-c g u` | Undo the last genie-made change, whatever its kind |

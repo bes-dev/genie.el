@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.13.0
+;; Version: 0.14.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -39,7 +39,14 @@
 ;;   C-j        newline                C-c C-n   start a new conversation
 ;;   M-p / M-n  earlier messages       C-c C-s   past conversations
 ;;   C-c C-/    pick a skill           C-c C-m   switch the model
-;;   TAB        complete a /skill name
+;;   TAB        complete a /skill name C-c C-r   go back to before a message
+;;                                     C-c C-b   return to a line left behind
+;;
+;; RET while the agent works does not wait for it: what is typed reaches
+;; the turn in flight as a correction.  Going back (C-c C-r) rewinds the
+;; conversation, the files, or both to before a message, and hands that
+;; message back to be edited; what followed it stays, as a line C-c C-b
+;; returns to.
 ;;
 ;; Skills are what the agent calls its `/name' commands: typing
 ;; `/review src/' sends the skill named review with those arguments.
@@ -47,7 +54,8 @@
 ;; full its context is and the step of the plan it is on.
 ;;
 ;; `genie-sessions' lists the conversations kept for a directory, newest
-;; first, to return to one (RET), start another (n) or delete one (d).
+;; first, to return to one (RET), start another (n), rename one (r) or
+;; delete one (d).
 ;; A conversation is a file elmee keeps; nothing about it lives in Emacs,
 ;; so it is there again after a restart.
 ;;
@@ -106,6 +114,10 @@ A link opens the first NAME.md found under any of them."
 (defvar-local genie-chat--recall nil
   "How far back `genie-chat-earlier' has gone, or nil.")
 (defvar-local genie-chat--thinking nil "Non-nil while the model reasons.")
+(defvar-local genie-chat--compacting nil
+  "Non-nil while the context is being summarized.")
+(defvar-local genie-chat--children nil
+  "Ids of the agents this conversation started that are still working.")
 (defvar-local genie-chat--answer "" "The answer text of the turn in flight.")
 (defvar-local genie-chat--answer-start nil "Marker where that answer begins.")
 (defvar-local genie-chat--tail nil "Marker where the transcript grows.")
@@ -140,6 +152,8 @@ It may signal an error to refuse the turn.")
     (define-key map (kbd "C-c C-s") #'genie-sessions)
     (define-key map (kbd "C-c C-m") #'genie-chat-model)
     (define-key map (kbd "C-c C-/") #'genie-chat-skill)
+    (define-key map (kbd "C-c C-r") #'genie-chat-rewind)
+    (define-key map (kbd "C-c C-b") #'genie-chat-branches)
     map)
   "Keymap for `genie-chat-mode'.")
 
@@ -187,32 +201,43 @@ whenever a turn ends."
         (genie-chat--converse nil)))
     buffer))
 
-(defun genie-chat--converse (resume)
-  "Point this chat at a conversation: a new one, or the one RESUME names.
-The buffer is emptied; a resumed conversation is played back into it."
-  (when genie-chat--session
-    (genie-acp-close genie-chat--session))
+(defun genie-chat--clear (&optional intro)
+  "Empty this chat down to its prompt, with the keys said first when INTRO."
   (let ((inhibit-read-only t))
     (erase-buffer)
     (setq genie-chat--tail (point-marker)
           genie-chat--calls (make-hash-table :test #'equal)
           genie-chat--busy nil genie-chat--thinking nil
+          genie-chat--compacting nil genie-chat--children nil
           genie-chat--answer "" genie-chat--answer-start nil
-          genie-chat--usage nil genie-chat--plan nil
-          genie-chat--title nil genie-chat--attached nil
+          genie-chat--plan nil genie-chat--attached nil
           genie-chat--said nil genie-chat--recall nil)
     (genie-chat--stop-clock)
-    (unless resume
+    (when intro
       (genie-chat--insert
        ;; Spelled out rather than looked up: `C-c C-m' would be shown as
        ;; `C-c RET', which is the same key and reads like a different one.
        "RET sends · C-j newline · M-p earlier messages · C-c C-/ skills · \
-C-c C-s past conversations · C-c C-m model\n"
+C-c C-s past conversations · C-c C-m model · C-c C-r go back\n"
        'shadow))
     (goto-char (point-max))
     (insert (propertize "\n❯ " 'face 'minibuffer-prompt
                         'read-only t 'rear-nonsticky t 'front-sticky t))
-    (setq genie-chat--input (point-marker)))
+    (setq genie-chat--input (point-marker))))
+
+(defun genie-chat--replayed (note)
+  "Dress the transcript a conversation was just played back into; add NOTE."
+  (genie-chat--dress (point-min) genie-chat--tail)
+  (genie-chat-note note)
+  (goto-char (point-max)))
+
+(defun genie-chat--converse (resume)
+  "Point this chat at a conversation: a new one, or the one RESUME names.
+The buffer is emptied; a resumed conversation is played back into it."
+  (when genie-chat--session
+    (genie-acp-close genie-chat--session))
+  (genie-chat--clear (not resume))
+  (setq genie-chat--usage nil genie-chat--title nil)
   (let ((buffer (current-buffer)))
     (cl-flet ((in-chat (function)
                 (lambda (&rest args)
@@ -235,6 +260,10 @@ C-c C-s past conversations · C-c C-m model\n"
              :on-options (in-chat (lambda (options)
                                     (setq genie-chat--options options)))
              :on-title (in-chat (lambda (title) (setq genie-chat--title title)))
+             :on-notice (in-chat #'genie-chat--on-notice)
+             :on-compaction (in-chat #'genie-chat--on-compaction)
+             :on-child (in-chat #'genie-chat--on-child)
+             :on-child-tool (in-chat #'genie-chat--on-child-tool)
              :on-ask (in-chat #'genie-chat--on-ask)
              :on-done (in-chat #'genie-chat--finish-turn)
              :on-fail (in-chat #'genie-chat--on-fail)
@@ -253,9 +282,8 @@ C-c C-s past conversations · C-c C-m model\n"
                          (lambda ()
                            (when (buffer-live-p buffer)
                              (with-current-buffer buffer
-                               (genie-chat--dress (point-min) genie-chat--tail)
-                               (genie-chat-note "— earlier conversation, resumed —\n")
-                               (goto-char (point-max)))))))))
+                               (genie-chat--replayed
+                                "— earlier conversation, resumed —\n"))))))))
 
 (defun genie-chat--shutdown ()
   "End the agent process of the chat being killed."
@@ -284,9 +312,13 @@ C-c C-s past conversations · C-c C-m model\n"
      ;; What is happening now comes first: it is what a glance is for, and
      ;; a long plan step must not push it off the edge.
      (when genie-chat--busy
-       (format "  ·  %s %ds (C-c C-k stops)"
-               (if genie-chat--thinking "thinking" "working")
+       (format "  ·  %s %ds (RET steers, C-c C-k stops)"
+               (cond (genie-chat--compacting "making room")
+                     (genie-chat--thinking "thinking")
+                     (t "working"))
                (floor (float-time (time-since genie-chat--busy)))))
+     (and genie-chat--children
+          (format "  ·  %d helping" (length genie-chat--children)))
      (and model (format "  ·  %s" model))
      (pcase genie-chat--usage
        (`(,(and used (pred numberp)) . ,(and size (pred numberp) (pred (< 0))))
@@ -411,6 +443,35 @@ part of a tool's output worth reading without being asked."
     (car (last (cl-remove-if (lambda (line) (string-prefix-p "[exit status" line))
                              (split-string (or text "") "\n" t))))))
 
+(defun genie-chat--on-notice (severity title)
+  "Say TITLE, something to know that is not part of the conversation.
+SEVERITY is the agent's word for how much it matters."
+  (genie-chat-note (format "⚠ %s\n" title)
+                   (if (equal severity "error") 'error 'warning)))
+
+(defun genie-chat--on-compaction (status)
+  "Follow the context being summarized, which is now in STATUS."
+  (setq genie-chat--compacting (equal status "in_progress"))
+  (when (equal status "completed")
+    (genie-chat-note "— earlier conversation summarized to make room —\n"))
+  (force-mode-line-update))
+
+(defun genie-chat--on-child (id title state)
+  "Note that the agent ID, shown as TITLE, is now in STATE."
+  (let ((working (not (equal state "idle"))))
+    (unless (eq working (and (member id genie-chat--children) t))
+      (setq genie-chat--children
+            (if working (cons id genie-chat--children)
+              (delete id genie-chat--children)))
+      (genie-chat-note (format "⤷ %s %s\n" title
+                               (if working "started" "finished")))
+      (force-mode-line-update))))
+
+(defun genie-chat--on-child-tool (title call)
+  "Log tool CALL of the helping agent shown as TITLE."
+  (genie-chat-note (format "  ⤷ %s · %s\n" title
+                           (or (plist-get call :title) "tool"))))
+
 (defun genie-chat--on-fail (message code)
   "Report that a request failed with MESSAGE and CODE, and end the turn."
   (genie-chat-note (format "[%s]\n" message) 'error)
@@ -430,7 +491,8 @@ part of a tool's output worth reading without being asked."
   "End the turn in flight, which stopped because of STOP.
 STOP is the agent's stop reason, or `failed' or `exited'."
   (when genie-chat--busy
-    (setq genie-chat--busy nil genie-chat--thinking nil)
+    (setq genie-chat--busy nil genie-chat--thinking nil
+          genie-chat--compacting nil)
     (genie-chat--stop-clock)
     (when (and genie-chat--answer-start
                (< genie-chat--answer-start genie-chat--tail))
@@ -560,15 +622,35 @@ Whatever was attached with `genie-ask' goes with it."
         (error (genie-chat--on-fail (error-message-string err) nil))))))
 
 (defun genie-chat-send ()
-  "Send what is typed after the prompt."
+  "Send what is typed after the prompt.
+While a turn is in flight it does not wait: what is typed reaches that
+turn as a correction, taken up at its next step."
   (interactive)
   (let ((text (string-trim (buffer-substring-no-properties
                             genie-chat--input (point-max)))))
     (when (string-empty-p text) (user-error "Type a message first"))
-    (when genie-chat--busy
-      (user-error "Genie is busy here — wait, or C-c C-k stops it"))
     (delete-region genie-chat--input (point-max))
-    (genie-chat-submit (current-buffer) text)))
+    (if genie-chat--busy
+        (genie-chat--steer text)
+      (genie-chat-submit (current-buffer) text))))
+
+(defun genie-chat--steer (text)
+  "Hand TEXT to the turn in flight.
+A turn that ended in the meantime is not steered: TEXT then starts the
+next one, as if it had been sent a moment later."
+  (let ((buffer (current-buffer)))
+    (genie-chat--on-user text)
+    (genie-acp-call
+     genie-chat--session "_session/steering"
+     (list :prompt (vector (list :type "text" :text text))
+           :_meta '(:steering (:idleBehavior "promptRequired")))
+     (lambda (result reason)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (cond (reason (genie-chat-note (format "[not taken: %s]\n" reason)
+                                          'error))
+                 ((equal (plist-get result :outcome) "promptRequired")
+                  (genie-chat-submit buffer text 'note)))))))))
 
 (defun genie-chat-abort ()
   "Stop the turn in flight, keeping the conversation."
@@ -649,6 +731,103 @@ directory of a Dired buffer, named for the agent to read itself."
               (list :type "resource_link" :uri (concat "file://" path)
                     :name (file-name-nondirectory
                            (directory-file-name path)))))))))
+
+;;;; Going back
+
+(defun genie-chat--with-tree (function)
+  "Call FUNCTION in this chat with its conversation as a tree.
+The tree is a plist of `:prompts', what was asked on the line the
+conversation stands on, and `:branches', every line there is.  FUNCTION
+runs from the event loop, free to use the minibuffer."
+  (when genie-chat--busy (user-error "Genie is busy here — stop it first"))
+  (let ((buffer (current-buffer)))
+    (genie-acp-call
+     genie-chat--session "_session/history" nil
+     (lambda (tree reason)
+       (run-at-time
+        0 nil
+        (lambda ()
+          (when (buffer-live-p buffer)
+            (with-current-buffer buffer
+              (if reason (message "🧞 %s" reason) (funcall function tree))))))))))
+
+(defun genie-chat--choose (prompt items text)
+  "Read one of ITEMS with PROMPT, each shown as its TEXT, numbered."
+  (let* ((number 0)
+         (choices (mapcar
+                   (lambda (item)
+                     (cons (format "%d  %s" (cl-incf number)
+                                   (car (split-string (funcall text item) "\n")))
+                           item))
+                   items)))
+    (cdr (assoc (completing-read prompt choices nil t) choices))))
+
+(defun genie-chat--moved (note &optional draft)
+  "Show the conversation as it stands after moving in its tree.
+It is said again from the start, NOTE is added, and DRAFT is put after
+the prompt to be edited."
+  (let ((buffer (current-buffer)))
+    (genie-chat--clear)
+    (genie-acp-call
+     genie-chat--session "session/load"
+     (list :cwd (genie-acp-session-directory genie-chat--session)
+           :mcpServers [])
+     (lambda (_result reason)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (genie-chat--replayed (if reason (format "[%s]\n" reason) note))
+           (when draft (genie-chat-draft buffer draft))))))))
+
+(defun genie-chat-rewind ()
+  "Go back to before an earlier message of this conversation.
+The conversation, the files as they were before that message's turn
+changed them, or both are put back; the message returns after the
+prompt to be edited and sent again.  What followed is not lost: it
+stays as a line of its own, and \\[genie-chat-branches] returns to it."
+  (interactive)
+  (genie-chat--with-tree
+   (lambda (tree)
+     (let* ((asked (genie-chat--choose
+                    "🧞 Go back to before: "
+                    (reverse (append (plist-get tree :prompts) nil))
+                    (lambda (prompt) (plist-get prompt :text))))
+            ;; A chat with a pipeline around its turns keeps the files
+            ;; itself, and files nobody recorded cannot be put back.
+            (restore (if (or genie-chat--start (not (plist-get asked :checkpoint)))
+                         "conversation"
+                       (nth 1 (read-multiple-choice
+                               "Put back"
+                               '((?e "everything" "the conversation and the files")
+                                 (?c "conversation" "what was said, not the files")
+                                 (?f "files" "the files, not what was said")))))))
+       (genie-acp-call
+        genie-chat--session "_session/rewind"
+        (list :promptId (plist-get asked :id) :restore restore)
+        (lambda (result reason)
+          (cond (reason (message "🧞 not rewound: %s" reason))
+                ((plist-get result :prompt)
+                 (genie-chat--moved "— back to before this message —\n"
+                                    (plist-get result :prompt)))
+                (t (message "🧞 the files are as they were before that message")))))))))
+
+(defun genie-chat-branches ()
+  "Return to a line of this conversation that going back left behind."
+  (interactive)
+  (genie-chat--with-tree
+   (lambda (tree)
+     (if-let* ((others (cl-remove-if (lambda (line) (plist-get line :active))
+                                     (append (plist-get tree :branches) nil)))
+               (line (genie-chat--choose
+                      "🧞 Return to the line ending with: " others
+                      (lambda (line) (plist-get line :last)))))
+         (genie-acp-call
+          genie-chat--session "_session/checkout"
+          (list :leaf (plist-get line :leaf))
+          (lambda (_result reason)
+            (if reason
+                (message "🧞 not moved: %s" reason)
+              (genie-chat--moved "— another line of this conversation —\n"))))
+       (message "🧞 this conversation has one line only")))))
 
 ;;;; Skills, the model, questions, signing in
 
@@ -777,6 +956,7 @@ read.  What is attached goes with the next message."
     (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "RET") #'genie-sessions-open)
     (define-key map "n" #'genie-sessions-new)
+    (define-key map "r" #'genie-sessions-rename)
     (define-key map "d" #'genie-sessions-delete)
     map)
   "Keymap for `genie-sessions-mode'.")
@@ -785,7 +965,8 @@ read.  What is attached goes with the next message."
   "The conversations kept for one directory, newest first.
 \\<genie-sessions-mode-map>\\[genie-sessions-open] returns to the one at \
 point, \\[genie-sessions-new] starts a new one,
-\\[genie-sessions-delete] deletes one, \\[revert-buffer] reads the list again."
+\\[genie-sessions-rename] renames one, \\[genie-sessions-delete] deletes \
+one, \\[revert-buffer] reads the list again."
   (setq tabulated-list-format [("When" 12 nil) ("Asked" 6 nil :right-align t)
                                ("About" 0 nil)]
         tabulated-list-padding 2)
@@ -850,7 +1031,7 @@ project you are in."
       (setq genie-sessions--chat chat)
       (genie-sessions--fetch))
     (pop-to-buffer list)
-    (message "RET returns to one · n starts a new one · d deletes · g refreshes · q closes")))
+    (message "RET returns to one · n starts a new one · r renames · d deletes · g refreshes · q closes")))
 
 (defun genie-sessions--idle-chat ()
   "Return this list's chat, which must not be in the middle of a turn."
@@ -879,6 +1060,25 @@ Its chat is filled with what was said and continues from there."
     (quit-window)
     (pop-to-buffer chat)
     (genie-chat-new)))
+
+(defun genie-sessions-rename (title)
+  "Call the conversation at point TITLE instead of what was first asked."
+  (interactive
+   (list (read-string "🧞 Call this conversation: "
+                      (string-remove-prefix
+                       "▸ " (aref (or (tabulated-list-get-entry)
+                                      (user-error "No conversation here"))
+                                  2)))))
+  (let ((chat genie-sessions--chat)
+        (buffer (current-buffer)))
+    (unless (buffer-live-p chat) (user-error "Its chat is gone"))
+    (genie-acp-rename
+     (buffer-local-value 'genie-chat--agent chat) (tabulated-list-get-id) title
+     (lambda (refused)
+       (if refused
+           (message "🧞 not renamed: %s" refused)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer (genie-sessions--fetch))))))))
 
 (defun genie-sessions-delete ()
   "Delete the conversation at point, for good."

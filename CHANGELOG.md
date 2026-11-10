@@ -3,6 +3,30 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.14.0] — 2026-11-10
+
+Everything elmee learned to say over the protocol today has a place here.
+
+- **`RET` during a turn steers it** instead of being refused: what is typed
+  reaches the turn in flight as a correction. A turn that ended in the
+  meantime gets it as its next message.
+- **Going back**: `C-c C-r` (`genie-chat-rewind`) rewinds the conversation,
+  the files or both to before an earlier message and hands that message
+  back to be edited; `C-c C-b` (`genie-chat-branches`) returns to a line
+  that was left. In the config chat only the conversation moves — its files
+  are the wish pipeline's to keep.
+- **Conversations can be named**: `r` in `genie-sessions`.
+- **Helpers are visible**: an agent the conversation delegated to shows
+  when it starts, each tool it runs and when it finishes; the header counts
+  those still working.
+- **Compaction and notices are said**: the header reads "making room" while
+  the context is summarized, and what went wrong outside the conversation
+  is an aside in the transcript.
+- `genie-acp-call` reaches any other request about a session;
+  `genie-acp-rename` names a conversation, open or not.
+
+Requires elmee `a45c818` or later.
+
 ## [0.13.0] — 2026-11-10
 
 The elmee agent, in full. Pi is gone; everything elmee says over the
