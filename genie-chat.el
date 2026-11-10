@@ -623,6 +623,18 @@ The one being left stays in the list `genie-sessions' shows."
       (goto-char (point-max))
       (insert text))))
 
+(defun genie-chat-region-context (beg end)
+  "Return the text between BEG and END as (LABEL . CONTENT-BLOCK).
+The label and the block's address name the buffer and the lines."
+  (let ((from (line-number-at-pos beg))
+        (to (line-number-at-pos end)))
+    (cons (format "%s:%d-%d" (buffer-name) from to)
+          (list :type "resource"
+                :resource
+                (list :uri (format "file://%s#L%d-%d"
+                                   (or (buffer-file-name) (buffer-name)) from to)
+                      :text (buffer-substring-no-properties beg end))))))
+
 (defun genie-chat-context (&optional whole)
   "Return what the person is looking at, as (LABEL . CONTENT-BLOCK), or nil.
 That is the active region; or, with WHOLE, the visited file or the
@@ -630,15 +642,7 @@ directory of a Dired buffer, named for the agent to read itself."
   (let ((file (buffer-file-name)))
     (cond
      ((use-region-p)
-      (let ((from (line-number-at-pos (region-beginning)))
-            (to (line-number-at-pos (region-end))))
-        (cons (format "%s:%d-%d" (buffer-name) from to)
-              (list :type "resource"
-                    :resource
-                    (list :uri (format "file://%s#L%d-%d"
-                                       (or file (buffer-name)) from to)
-                          :text (buffer-substring-no-properties
-                                 (region-beginning) (region-end)))))))
+      (genie-chat-region-context (region-beginning) (region-end)))
      ((and whole (or file (derived-mode-p 'dired-mode)))
       (let ((path (expand-file-name (or file default-directory))))
         (cons (abbreviate-file-name path)
