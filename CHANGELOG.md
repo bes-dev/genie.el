@@ -3,6 +3,48 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.15.0] — 2026-11-11
+
+A new architecture: wishes that can be taken back, a genie that chooses the
+form a wish is granted in, and Emacs as that genie's own eyes and hands.
+
+- **Reversible wishes** (`genie-wish.el`, depends on nothing). A wish is a
+  file under `wishes/` whose changes go through effects that remember the
+  way back — `genie-set`, `genie-key`, `genie-hook`, `genie-advice`,
+  `genie-enable`, `genie-disable`, `genie-add`, `genie-timer`,
+  `genie-effect`, and `genie-after` to wait for a library. Switching one
+  off undoes it now, with no restart; one that signals is switched off and
+  reported instead of breaking startup.
+- **The lamp** (`genie-lamp`): the wishes, to switch off and on, look into,
+  or forget. A switch is a commit `genie-undo` takes back.
+- **One way in.** `M-x genie` grants a wish as an answer, as something done
+  on the spot where you were, or as a wish file — the genie chooses, and
+  asks when a wish is ambiguous. The wish carries the buffer and the region
+  it was made in.
+- **Emacs as tools.** The agent can `describe`, `apropos`, read `source`
+  and `messages`, and `eval` in the running session, over the ACP
+  connection itself (needs elmee with MCP over ACP).
+- **Validation asks two questions**: can it be taken back (a bare
+  `add-hook`, `setq`, `define-key` or mode call in a wish file goes back
+  to the agent), and does the config still start. What would run on every
+  keystroke or wait synchronously is named.
+- **The main thread is left alone.** Conjured code never runs in a process
+  filter, waits for a free minibuffer, and stops on `C-g`. Reading a long
+  message was quadratic: a 10 MB tool result froze Emacs for 20 s and now
+  takes 40 ms; streaming 20 000 tokens went from 8.7 s to 45 ms.
+- **`genie-setup`** readies any configuration; **`genie-command-map`** puts
+  everything on one prefix, bound by the first wish; **`genie-panic`**
+  switches every wish off for the session.
+- **Undo is exact**: dropping a wish switches it off live. "Definitions stay
+  loaded until restart" is gone.
+- A spell cast for the third time says how to keep it.
+
+Renamed: `genie-spell-risky-functions` → `genie-risky-functions`; in
+`genie-confirm`, `risky-spell` → `risky-code`. The `:finish` function of a
+chat now takes the stop reason only. `genie.el` is split into
+`genie-pipeline.el`, `genie-spell.el`, `genie-lamp.el`, `genie-live.el`,
+`genie-tools.el` and a small `genie.el`.
+
 ## [0.14.0] — 2026-11-10
 
 Everything elmee learned to say over the protocol today has a place here.

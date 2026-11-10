@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.14.0
+;; Version: 0.15.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -63,6 +63,14 @@
 ;;   :on-done STOP-REASON   the turn ended ("end_turn", "cancelled", ...)
 ;;   :on-fail MESSAGE CODE  a request was refused
 ;;   :on-exit               the agent process died
+;;
+;; Beside the handlers, `:tools' gives the agent things to call in this
+;; Emacs.  Each is a plist of `:name', `:description', `:schema' (a JSON
+;; schema, as a plist) and `:call', a function of the arguments and of a
+;; function to answer with — a text, and non-nil when it is a failure.
+;; They are served over the connection that is already there: the
+;; session names Emacs as an MCP server the client itself is, so there is
+;; no process to start and no port to open.
 
 ;;; Code:
 
@@ -71,13 +79,18 @@
 
 (cl-defstruct (genie-acp-agent (:constructor genie-acp--make-agent) (:copier nil))
   "One agent process, and what is known about it."
-  command proc (acc "") stderr (next-id 0) pending
+  command proc
+  ;; Pieces of a line still arriving, newest first.
+  acc
+  stderr (next-id 0) pending
   ;; nil before the handshake, `greeting' during it, t after.
   ready
   ;; Thunks waiting for the handshake.
   waiting
   ;; Open sessions, as (ID . SESSION).
   sessions
+  ;; Tools sessions offered, as (SERVER-ID . TOOLS).
+  servers
   ;; Agents a session started, as (ID SESSION . TITLE): each speaks under an
   ;; id of its own, and what it says belongs to the session that started it.
   children
@@ -136,7 +149,7 @@ at startup has a readable reason."
                     (setf (genie-acp-agent-stderr agent)
                           (generate-new-buffer " *genie-acp stderr*")))))
     (with-current-buffer errbuf (erase-buffer))
-    (setf (genie-acp-agent-acc agent) ""
+    (setf (genie-acp-agent-acc agent) nil
           (genie-acp-agent-next-id agent) 0
           (genie-acp-agent-pending agent) nil
           (genie-acp-agent-ready agent) 'greeting
@@ -188,6 +201,7 @@ reopens it — without replaying it — the next time it is used."
       (setf (genie-acp-agent-ready agent) nil
             (genie-acp-agent-waiting agent) nil
             (genie-acp-agent-children agent) nil
+            (genie-acp-agent-servers agent) nil
             (genie-acp-agent-sessions agent) nil)
       (dolist (session sessions)
         (setf (genie-acp-session-resume session) (genie-acp-session-id session)
@@ -221,18 +235,22 @@ reopens it — without replaying it — the next time it is used."
   (or (plist-get err :message) fallback))
 
 (defun genie-acp--filter (agent string)
-  "Accumulate STRING from AGENT; dispatch each complete JSON line."
-  (setf (genie-acp-agent-acc agent)
-        (concat (genie-acp-agent-acc agent) string))
-  (let ((lines (split-string (genie-acp-agent-acc agent) "\n")))
-    (setf (genie-acp-agent-acc agent) (car (last lines)))
-    (dolist (line (butlast lines))
-      (unless (string-empty-p (string-trim line))
-        (when-let* ((message (ignore-errors
-                               (json-parse-string line :object-type 'plist
-                                                  :null-object nil
-                                                  :false-object nil))))
-          (genie-acp--dispatch agent message))))))
+  "Accumulate STRING from AGENT; dispatch each complete JSON line.
+A piece that ends no line is only kept: a long message arrives in many
+pieces, and joining them once, when its newline comes, is what keeps
+the work proportional to what was sent."
+  (push string (genie-acp-agent-acc agent))
+  (when (string-search "\n" string)
+    (let ((lines (split-string
+                  (apply #'concat (nreverse (genie-acp-agent-acc agent))) "\n")))
+      (setf (genie-acp-agent-acc agent) (last lines))
+      (dolist (line (butlast lines))
+        (unless (string-empty-p (string-trim line))
+          (when-let* ((message (ignore-errors
+                                 (json-parse-string line :object-type 'plist
+                                                    :null-object nil
+                                                    :false-object nil))))
+            (genie-acp--dispatch agent message)))))))
 
 (defun genie-acp--dispatch (agent message)
   "Act on one MESSAGE from AGENT.
@@ -261,6 +279,8 @@ the agent asks for is declined, since nothing else was offered."
               (genie-acp--fire (car child) :on-child-tool (cdr child) update))))))
      ((and id (equal method "elicitation/create"))
       (genie-acp--ask agent id params))
+     ((and id (equal method "mcp/message"))
+      (genie-acp--serve agent id params))
      (id
       (genie-acp--send agent (list :jsonrpc "2.0" :id id
                                    :error '(:code -32601
@@ -287,6 +307,41 @@ the agent takes as \"decide for yourself\", not as a failure."
     (if (and session (plist-get (genie-acp-session-handlers session) :on-ask))
         (genie-acp--fire session :on-ask params reply)
       (funcall reply nil))))
+
+(defun genie-acp--serve (agent id params)
+  "Answer request ID of AGENT: an MCP request, in PARAMS, for a session's tools.
+Listing them and calling one are all a tool needs.  A call is answered
+when the tool answers, which may be later: nothing is waited for here."
+  (let* ((tools (cdr (assoc (plist-get params :serverId)
+                            (genie-acp-agent-servers agent))))
+         (asked (plist-get params :params))
+         (tool (cl-find (plist-get asked :name) tools :test #'equal
+                        :key (lambda (tool) (plist-get tool :name))))
+         (answer (lambda (result)
+                   (genie-acp--send agent (list :jsonrpc "2.0" :id id
+                                                :result result))))
+         (said (lambda (text &optional failed)
+                 (funcall answer
+                          `(:result (:content [(:type "text" :text ,text)]
+                                     :isError ,(if failed t :false)))))))
+    (pcase (plist-get params :method)
+      ("tools/list"
+       (funcall
+        answer
+        (list :result
+              (list :tools
+                    (vconcat
+                     (mapcar (lambda (tool)
+                               (list :name (plist-get tool :name)
+                                     :description (plist-get tool :description)
+                                     :inputSchema (plist-get tool :schema)))
+                             tools))))))
+      ((and "tools/call" (guard tool))
+       (condition-case err
+           (funcall (plist-get tool :call) (plist-get asked :arguments) said)
+         (error (funcall said (error-message-string err) t))))
+      (method
+       (funcall answer `(:error (:code -32601 :message ,method)))))))
 
 (defun genie-acp--update (session update)
   "Translate one `session/update' UPDATE into the handlers of SESSION."
@@ -372,8 +427,17 @@ names instead of starting one, playing back what was said in it."
   "Ask the agent for SESSION: a new conversation, or the one it resumes."
   (let* ((agent (genie-acp-session-agent session))
          (resume (genie-acp-session-resume session))
+         (tools (plist-get (genie-acp-session-handlers session) :tools))
+         (server (and tools
+                      (format "emacs-%d"
+                              (length (genie-acp-agent-servers agent)))))
          (params (list :cwd (genie-acp-session-directory session)
-                       :mcpServers [])))
+                       :mcpServers
+                       (if server
+                           `[(:type "acp" :name "emacs" :serverId ,server)]
+                         []))))
+    (when server
+      (push (cons server tools) (genie-acp-agent-servers agent)))
     (when resume
       ;; What was said is played back before the request is answered, so
       ;; the session has to be findable by its id already.

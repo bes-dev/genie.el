@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.14.0
+;; Version: 0.15.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -70,6 +70,7 @@
 (require 'tabulated-list)
 (require 'project)
 (require 'genie-acp)
+(require 'genie-tools)
 
 (defgroup genie nil
   "The elmee agent in Emacs: conversations, and a self-modifying config."
@@ -118,8 +119,8 @@ A link opens the first NAME.md found under any of them."
   "Non-nil while the context is being summarized.")
 (defvar-local genie-chat--children nil
   "Ids of the agents this conversation started that are still working.")
-(defvar-local genie-chat--answer "" "The answer text of the turn in flight.")
-(defvar-local genie-chat--answer-start nil "Marker where that answer begins.")
+(defvar-local genie-chat--answer-start nil
+  "Marker where the answer of the turn in flight begins, once it has.")
 (defvar-local genie-chat--tail nil "Marker where the transcript grows.")
 (defvar-local genie-chat--input nil "Marker where the typed message begins.")
 (defvar-local genie-chat--calls nil "Tool call id → marker at its line.")
@@ -134,7 +135,7 @@ A link opens the first NAME.md found under any of them."
   "Function called with what was asked before a turn is sent.
 It may signal an error to refuse the turn.")
 (defvar-local genie-chat--finish nil
-  "Function called with (STOP-REASON ANSWER) when a turn ends.")
+  "Function called with why it stopped when a turn ends.")
 
 (defvar genie-chat--history nil "Minibuffer history of answers to the agent.")
 
@@ -180,8 +181,8 @@ conversation elmee keeps, and `genie-sessions' returns to it."
 OPTIONS is a plist: `:name' is the buffer's name, `:command' the agent's
 argv (default `genie-chat-command'), `:start' a function called before
 every turn with what was asked (or the symbol `note'), free to refuse it
-by signalling, and `:finish' one called with (STOP-REASON ANSWER)
-whenever a turn ends."
+by signalling, and `:finish' one called with why it stopped whenever a
+turn ends."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
          (name (or (plist-get options :name)
                    (format "*genie: %s*"
@@ -209,7 +210,7 @@ whenever a turn ends."
           genie-chat--calls (make-hash-table :test #'equal)
           genie-chat--busy nil genie-chat--thinking nil
           genie-chat--compacting nil genie-chat--children nil
-          genie-chat--answer "" genie-chat--answer-start nil
+          genie-chat--answer-start nil
           genie-chat--plan nil genie-chat--attached nil
           genie-chat--said nil genie-chat--recall nil)
     (genie-chat--stop-clock)
@@ -247,6 +248,8 @@ The buffer is emptied; a resumed conversation is played back into it."
             (genie-acp-open
              genie-chat--agent genie-chat--directory
              :resume resume
+             ;; What the agent may ask of this Emacs, and do in it.
+             :tools genie-tools
              :on-text (in-chat #'genie-chat--on-text)
              :on-thought (in-chat #'genie-chat--on-thought)
              :on-user (in-chat #'genie-chat--on-user)
@@ -388,9 +391,8 @@ conversation itself."
 
 (defun genie-chat--on-text (delta)
   "Stream answer DELTA, swallowing the blank chunks around tool activity."
-  (let ((leading (string-empty-p (string-trim genie-chat--answer))))
-    (setq genie-chat--thinking nil
-          genie-chat--answer (concat genie-chat--answer delta))
+  (let ((leading (not genie-chat--answer-start)))
+    (setq genie-chat--thinking nil)
     (when (and leading (not (string-empty-p (string-trim delta))))
       (genie-chat--fresh-line)
       (setq genie-chat--answer-start (copy-marker genie-chat--tail)))
@@ -408,9 +410,20 @@ conversation itself."
   (genie-chat--fresh-line)
   (puthash (plist-get call :toolCallId) (copy-marker genie-chat--tail)
            genie-chat--calls)
-  (genie-chat--insert
-   (format "⏳ %s\n" (or (plist-get call :title) (plist-get call :kind) "tool"))
-   'shadow))
+  (genie-chat--insert (format "⏳ %s\n" (genie-chat--call-title call)) 'shadow))
+
+(defun genie-chat--call-title (call)
+  "Return the line that stands for tool CALL in the transcript.
+A call into this Emacs reads as one: what was asked of it, and with what."
+  (let ((title (or (plist-get call :title) (plist-get call :kind) "tool")))
+    (if (string-match "\\`mcp__emacs__\\(.*\\)" title)
+        (format "emacs %s %s" (match-string 1 title)
+                (truncate-string-to-width
+                 (car (split-string
+                       (format "%s" (or (cadr (plist-get call :rawInput)) ""))
+                       "\n"))
+                 60 nil nil "…"))
+      title)))
 
 (defun genie-chat--on-tool-update (call)
   "Mark the line of tool CALL with how it ended.
@@ -504,7 +517,7 @@ STOP is the agent's stop reason, or `failed' or `exited'."
        (genie-chat-note "— stopped at the step limit; say “continue” to go on —\n")))
     (force-mode-line-update)
     (if genie-chat--finish
-        (funcall genie-chat--finish stop genie-chat--answer)
+        (funcall genie-chat--finish stop)
       ;; Someone who went elsewhere while it worked is told it is done.
       (unless (eq (window-buffer) (current-buffer))
         (message "🧞 %s: %s" (buffer-name)
@@ -609,7 +622,7 @@ Whatever was attached with `genie-ask' goes with it."
           (genie-chat-note (format "📎 %s\n" (car item)))))
       (setq genie-chat--busy (current-time) genie-chat--thinking nil
             genie-chat--recall nil
-            genie-chat--answer "" genie-chat--answer-start nil
+            genie-chat--answer-start nil
             genie-chat--attached nil)
       (genie-chat--start-clock)
       (force-mode-line-update)
@@ -940,6 +953,7 @@ An active region is attached as it is; with prefix argument WHOLE the
 visited file — or in Dired the directory — is named for the agent to
 read.  What is attached goes with the next message."
   (interactive "P")
+  (genie-live-remember-place)
   (let* ((item (genie-chat-context whole))
          (chat (genie-chat-open (genie-chat--here))))
     (deactivate-mark)

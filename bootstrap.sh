@@ -3,9 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/bes-dev/genie.el/main/bootstrap.sh | bash
 #
-# Creates the directory (refusing to touch an existing config), writes the
-# minimal init.el from the README, and makes the directory a git repository —
-# genie's wish pipeline commits every change, so the config root must be one.
+# Creates the directory (refusing to touch an existing config), writes a
+# minimal init.el and the first wish — genie on C-c g — and makes the
+# directory a git repository: every wish is a commit, so the root must be one.
 # Override the target with EMACS_D=/path.
 
 set -euo pipefail
@@ -22,17 +22,17 @@ command -v git >/dev/null || { echo "genie: git is required." >&2; exit 1; }
 command -v emacs >/dev/null || { echo "genie: emacs not found on PATH." >&2; exit 1; }
 emacs --batch --eval '(kill-emacs (if (< emacs-major-version 29) 1 0))' ||
   echo "genie: warning — this init.el uses package-vc-install (Emacs 29+); on 28 clone the repo and use load-path instead." >&2
-command -v elmee >/dev/null || command -v pi >/dev/null ||
-  echo "genie: warning — no agent backend on PATH; install elmee (https://github.com/bes-dev/elmee) or Pi (https://github.com/badlogic/pi-mono)." >&2
+command -v elmee >/dev/null ||
+  echo "genie: warning — elmee is not on PATH; install it from https://github.com/bes-dev/elmee." >&2
 
-mkdir -p "$EMACS_D"
+mkdir -p "$EMACS_D/wishes"
 cat > "$EMACS_D/init.el" <<'EOF'
-;;; init.el --- All you need -*- lexical-binding: t; -*-
+;;; init.el --- An empty lamp -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; An empty lamp: genie and nothing else.  Everything this config will
-;; ever contain arrives as a wish (C-c g g), validated, reviewed and
-;; committed — `git log' is its biography.
+;; Genie and nothing else.  Everything this Emacs will ever do arrives as
+;; a wish (C-c g g): a file under wishes/ that is validated, committed and
+;; can be switched off again in `genie-lamp'.  `git log' is its biography.
 
 ;;; Code:
 
@@ -42,42 +42,40 @@ cat > "$EMACS_D/init.el" <<'EOF'
 ;; The genie itself, straight from the repository (Emacs 29+).
 (unless (package-installed-p 'genie)
   (package-vc-install "https://github.com/bes-dev/genie.el"))
-(require 'genie)
 
-;; Wishes apply as soon as they validate — judge them in the editor,
-;; take them back with C-c g u.  See `genie-confirm' for the ceremonies.
-(setq genie-confirm '(risky-spell))
+;; Wishes apply as soon as they validate — judge them in the editor, take
+;; them back with C-c g u.  See `genie-confirm' for the ceremonies.
+(setq genie-confirm '(risky-code))
 
-;; The lamp's controls.
-(global-set-key (kbd "C-c g g") #'genie)         ; state a wish
-(global-set-key (kbd "C-c g c") #'genie-chat)    ; the chat about this config
-(global-set-key (kbd "C-c g a") #'genie-ask)     ; the agent, about where you are
-(global-set-key (kbd "C-c g d") #'genie-diff)    ; review the pending diff
-(global-set-key (kbd "C-c g u") #'genie-undo)    ; revert the last wish
-(global-set-key (kbd "C-c g k") #'genie-abort)   ; abort the turn in flight
-(global-set-key (kbd "C-c g s") #'genie-spell)   ; conjure an ephemeral command
-(global-set-key (kbd "C-c g x") #'genie-cast)    ; cast the current spell
-(global-set-key (kbd "C-c g !") #'genie-cantrip) ; one-shot: conjure and run here
-(global-set-key (kbd "C-c g m") #'genie-manual)  ; the manual, grown wish by wish
-(dotimes (i 10)                                  ; ten programmable spell registers
-  (global-set-key (kbd (format "C-c g %d" i)) #'genie-cast-register))
+;; Wishes granted by genie: each a file of its own that can be taken back.
+(require 'genie-wish)
+(genie-wish-load)
 
 ;;; init.el ends here
 EOF
 
+cat > "$EMACS_D/wishes/genie-keys.el" <<'EOF'
+;;; genie-keys.el --- the first wish -*- lexical-binding: t; -*-
+
+(autoload 'genie-command-map "genie" nil t 'keymap)
+
+(genie-wish genie-keys
+  "Genie on C-c g: g a wish, c its chat, l the lamp, u undo."
+  (genie-key global-map "C-c g" 'genie-command-map))
+EOF
+
 # Wishes are commits: the config root must be a git repository.
 git -C "$EMACS_D" init -q
-git -C "$EMACS_D" add init.el
-git -C "$EMACS_D" commit -qm "init: an empty lamp" ||
+git -C "$EMACS_D" add init.el wishes/genie-keys.el
+git -C "$EMACS_D" commit -qm "genie: an empty lamp" ||
   git -C "$EMACS_D" -c user.name=genie -c user.email=genie@localhost \
-      commit -qm "init: an empty lamp"
+      commit -qm "genie: an empty lamp"
 
 cat <<EOF
 genie: lamp ready at $EMACS_D
 
 Next:
-  1. Make sure an agent backend is installed (elmee by default; for Pi:
-     add (setq genie-backend 'pi) to init.el — or wish it in later).
+  1. Make sure elmee is installed: https://github.com/bes-dev/elmee
   2. Launch Emacs. The first start installs genie from GitHub.
-  3. Rub the lamp: C-c g g — and don't waste wishes on trifles.
+  3. Rub the lamp: C-c g g — and C-c g l shows what you have wished for.
 EOF
