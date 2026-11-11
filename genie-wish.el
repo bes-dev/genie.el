@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, lisp
 ;; URL: https://github.com/bes-dev/genie.el
@@ -69,6 +69,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 
 (defcustom genie-wish-directory
   (expand-file-name "wishes" user-emacs-directory)
@@ -266,14 +267,46 @@ Taken back, KEY is bound to what it was bound to in KEYMAP."
      (lambda () (define-key keymap keys command))
      (lambda () (define-key keymap keys (and (not (numberp old)) old))))))
 
+(defun genie-wish--buffers-in (hook)
+  "Return the buffers already in the mode whose hook HOOK is, if it is one."
+  (let* ((name (symbol-name hook))
+         (mode (and (string-suffix-p "-mode-hook" name)
+                    (intern-soft (substring name 0 -5)))))
+    (when (and mode (fboundp mode))
+      (cl-remove-if-not
+       (lambda (buffer)
+         (and (not (string-prefix-p " " (buffer-name buffer)))
+              (with-current-buffer buffer
+                (or (derived-mode-p mode)
+                    (and (boundp mode) (symbol-value mode))))))
+       (buffer-list)))))
+
 (defun genie-hook (hook function &optional depth)
   "Add FUNCTION to HOOK, at DEPTH as for `add-hook'.
-Taken back, it is removed, unless it was there before."
-  (let ((was (and (default-boundp hook) (memq function (default-value hook)))))
+A mode's hook only runs when a buffer enters the mode, so FUNCTION is
+also called now in the buffers that are already in it: the wish holds
+for what is open, not only for what is opened next.  Taken back, the
+function is removed unless it was there before, and a minor mode it
+switched on in those buffers is switched off again."
+  (let ((was (and (default-boundp hook) (memq function (default-value hook))))
+        (minor (and (symbolp function) (memq function minor-mode-list)))
+        switched)
     (genie-effect
      (format "%s on %s" function hook)
-     (lambda () (add-hook hook function depth))
-     (lambda () (unless was (remove-hook hook function))))))
+     (lambda ()
+       (add-hook hook function depth)
+       (dolist (buffer (genie-wish--buffers-in hook))
+         (with-current-buffer buffer
+           (let ((off (and minor (boundp function)
+                           (not (symbol-value function)))))
+             (ignore-errors (funcall function))
+             (when off (push buffer switched))))))
+     (lambda ()
+       (unless was (remove-hook hook function))
+       (dolist (buffer switched)
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (ignore-errors (funcall function -1)))))))))
 
 (defun genie-advice (symbol how function)
   "Advise SYMBOL with FUNCTION, HOW as for `advice-add'.

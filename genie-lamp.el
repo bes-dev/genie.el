@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el

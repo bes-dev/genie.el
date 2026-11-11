@@ -43,8 +43,12 @@ a wish makes its changes through effects that each remember the way back:
     (genie-key org-mode-map "C-c d" #'my-duplicate-line)))
 ```
 
-Switch it off and the key, the option, the hook and the mode are as they
-were — now, without restarting. The effects are `genie-set`, `genie-key`,
+It takes effect the moment it is applied, with nothing for you to do: a
+function added to a mode's hook also runs in the buffers already in that
+mode, and a package the wish needs is installed by the Emacs that validates
+it and is simply there. Switch the wish off and the key, the option, the
+hook and the mode are as they were — in those open buffers too — without
+restarting. The effects are `genie-set`, `genie-key`,
 `genie-hook`, `genie-advice`, `genie-enable`, `genie-disable`, `genie-add`,
 `genie-timer`, and `genie-effect` for anything else that has a way back;
 `genie-after` defers part of a wish until a library is loaded.
@@ -184,8 +188,15 @@ In any chat:
   the header counts the ones still working. A context being summarized to
   make room says so, and so does anything that went wrong outside the
   conversation, such as an MCP server that would not start.
-- **Links.** Paths in an answer open on `RET`/click; `[[wikilinks]]` open
-  the page of that name under `genie-chat-wiki-roots`.
+- **An answer reads as it means while it arrives.** Markdown is dressed a
+  line at a time as it streams — headings, emphasis, bullets, quotations,
+  code set apart by a rule down its side — with the marks hidden, not
+  removed: copy it and the markdown comes along. A tool call is one line
+  saying what is done (`$ make test`, `edit src/a.el`, `λ describe C-c d`),
+  marked when it ends, with the reason if it failed.
+- **Links.** Paths in an answer open on `RET`/click, as do URLs and
+  `[text](links)`; `[[wikilinks]]` open the page of that name under
+  `genie-chat-wiki-roots`.
 - **Signing in.** A model that needs an account says so; `M-x genie-login`
   runs elmee's browser sign-in.
 
@@ -269,6 +280,7 @@ One file, one job; each usable without the ones below it.
 | `genie-acp.el` | An [ACP](https://agentclientprotocol.com) client: one warm process, any number of sessions, tools served back to the agent. |
 | `genie-live.el` | Running conjured code in the live session: screened, off the filter, in place, undoable. |
 | `genie-tools.el` | Emacs as tools for its agent. |
+| `genie-markdown.el` | Markdown dressed a line at a time, as it streams. |
 | `genie-chat.el` | The chat buffer and the list of conversations, for any directory. |
 | `genie-pipeline.el` | A change to the configuration, start to finish: check, review, commit, make live, undo. |
 | `genie-spell.el` | Cantrips, spells and registers. |

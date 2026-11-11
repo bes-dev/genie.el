@@ -270,7 +270,7 @@ newest first, and `genie-tests--say' plays the agent's side."
     (genie-chat--on-text "answer")
     (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
                    "half a thought"))
-    (should (string-match-p "❯ first\n\nan answer\n❯ half a thought\\'"
+    (should (string-match-p "\nfirst\n\nan answer\n❯ half a thought\\'"
                             (buffer-string)))
     ;; the transcript cannot be typed into; the message can
     (should-error (progn (goto-char (point-min)) (insert "x")))
@@ -290,32 +290,63 @@ newest first, and `genie-tests--say' plays the agent's side."
     (should (string-match-p "✓ read init.el\n✗ exec make\n  make: \\*\\*\\* no rule\n"
                             (buffer-string)))))
 
-(ert-deftest genie-chat-dresses-links-and-leaves-the-words ()
-  "A path that exists and a wikilink become buttons; nothing is rewritten."
+(ert-deftest genie-chat-dresses-an-answer-as-it-arrives ()
+  "Each finished line is dressed where it stands; the words are left alone."
   (genie-tests--with-chat
     (let* ((file (expand-file-name "notes.md" directory))
            (said (format "See %s:3 and [[notes]], not /no/such/file; \
-docs at https://example.com/docs." file)))
+docs at https://example.com/docs." file))
+           (answer (concat "# Result\n" said "\n- **done** with `make`\n"
+                           "```elisp\n(+ 1 2)\n```\nlast")))
       (with-temp-file file (insert "a\nb\nc\n"))
-      (genie-chat--insert said)
-      (genie-chat--dress (point-min) genie-chat--tail)
-      (goto-char (point-min))
-      (should (search-forward said nil t))
-      (goto-char (match-beginning 0))
-      (search-forward "notes.md")
-      (should (equal (button-get (button-at (1- (point))) 'file) file))
-      (should (= (button-get (button-at (1- (point))) 'line) 3))
-      (search-forward "[[notes")
-      (should (equal (button-get (button-at (point)) 'page) "notes"))
-      (search-forward "/no/such")
-      (should-not (button-at (point)))
-      (search-forward "example.com")
-      (should (equal (button-get (button-at (point)) 'url)
-                     "https://example.com/docs"))
+      (setq genie-chat--busy (current-time))
+      ;; in pieces that respect no line, as a model sends them
+      (dolist (piece (seq-partition answer 7))
+        (genie-chat--on-text piece))
+      (cl-flet ((at (text) (goto-char (point-min)) (search-forward text)
+                    (match-beginning 0)))
+        ;; what was written is all still there
+        (should (string-search answer (buffer-string)))
+        ;; and it reads as what it means
+        (should (get-text-property (at "# ") 'invisible))
+        (should (eq (get-text-property (at "Result") 'face)
+                    'genie-markdown-heading))
+        (should (get-text-property (at "**done") 'invisible))
+        (should (memq 'bold (ensure-list (get-text-property (at "done") 'face))))
+        (should (get-text-property (at "- **") 'display))
+        (should (memq 'genie-markdown-code
+                      (ensure-list (get-text-property (at "make") 'face))))
+        (should (equal (get-text-property (at "```elisp") 'display) "elisp"))
+        (should (string-match-p "│" (get-text-property (at "(+ 1 2)") 'line-prefix)))
+        (should (equal (button-get (button-at (at "notes.md")) 'file) file))
+        (should (= (button-get (button-at (at "notes.md")) 'line) 3))
+        (should (equal (button-get (button-at (at "[[notes")) 'page) "notes"))
+        (should-not (button-at (at "/no/such")))
+        (should (equal (button-get (button-at (at "example.com")) 'url)
+                       "https://example.com/docs")))
       (let ((genie-chat-wiki-roots (list directory)))
         (cl-letf (((symbol-function 'find-file-other-window)
                    (lambda (found) (should (equal found file)))))
           (genie-chat--open-page "notes"))))))
+
+(ert-deftest genie-chat-a-tool-call-reads-as-what-is-done ()
+  "A command as typed, a file by its name here, a question to Emacs as one."
+  (genie-tests--with-chat
+    (let ((there (expand-file-name "src/a.el" directory)))
+      (should (equal (genie-chat--call-title
+                      '(:title "exec make test" :kind "execute"
+                        :rawInput (:command "make test\necho done")))
+                     "$ make test"))
+      (should (equal (genie-chat--call-title
+                      `(:title "apply_patch" :kind "edit"
+                        :locations [(:path ,there)]))
+                     "edit src/a.el"))
+      (should (equal (genie-chat--call-title
+                      '(:title "mcp__emacs__describe" :kind "other"
+                        :rawInput (:key "C-c d")))
+                     "λ describe C-c d"))
+      (should (equal (genie-chat--call-title '(:title "web_search emacs"))
+                     "web_search emacs")))))
 
 (ert-deftest genie-chat-a-turn-carries-what-was-attached ()
   "What `genie-ask' attached goes with the next message, once."
@@ -329,7 +360,7 @@ docs at https://example.com/docs." file)))
         (should (equal (mapcar (lambda (block) (plist-get block :type)) sent)
                        '("resource" "text")))
         (should-not genie-chat--attached)
-        (should (string-match-p "❯ explain this\n\n📎 init.el:1-2" (buffer-string)))
+        (should (string-match-p "\nexplain this\n\n📎 init.el:1-2" (buffer-string)))
         ;; a second message while that one runs is refused, not queued
         (should-error (genie-chat-submit (current-buffer) "and this")
                       :type 'user-error)))))
@@ -460,7 +491,7 @@ docs at https://example.com/docs." file)))
         (should (equal (caar called) "_session/steering"))
         (should (equal (plist-get (aref (plist-get (cadar called) :prompt) 0) :text)
                        "not that file"))
-        (should (string-match-p "❯ not that file" (buffer-string)))
+        (should (string-match-p "\nnot that file\n" (buffer-string)))
         (should (= genie-chat--input (point-max)))
         (should-not submitted)
         ;; a turn that ended in the meantime gets it as its next prompt
@@ -503,8 +534,8 @@ docs at https://example.com/docs." file)))
                        '(:promptId 4 :restore "conversation")))
         (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
                        "second"))
-        (should (string-match-p "❯ first" (buffer-string)))
-        (should-not (string-match-p "❯ second\n" (buffer-string)))
+        (should (string-match-p "\\`first\n" (buffer-string)))
+        (should-not (string-match-p "\nsecond\n" (buffer-string)))
         (should (string-match-p "back to before this message" (buffer-string)))))))
 
 (ert-deftest genie-chat-says-what-happens-beside-the-conversation ()
@@ -1311,6 +1342,25 @@ The effect is gone with the revert; undo must not error or strand it."
     (genie-wish-keep 'quiet t)
     (should (memq 'q genie-tests--list))
     (should-not (genie-wish-disabled))))
+
+(ert-deftest genie-wish-a-mode-hook-holds-for-what-is-already-open ()
+  "A wish on a mode's hook reaches the open buffers, and leaves them again."
+  (genie-tests--with-wishes
+    (let ((code (generate-new-buffer "genie-tests.el"))
+          (text (generate-new-buffer "genie-tests.txt")))
+      (unwind-protect
+          (progn
+            (with-current-buffer code (delay-mode-hooks (emacs-lisp-mode)))
+            (with-current-buffer text (delay-mode-hooks (text-mode)))
+            (genie-wish numbers "Number the lines of programs."
+              (genie-hook 'prog-mode-hook #'display-line-numbers-mode))
+            (should (buffer-local-value 'display-line-numbers-mode code))
+            (should-not (buffer-local-value 'display-line-numbers-mode text))
+            (genie-wish-off 'numbers)
+            (should-not (buffer-local-value 'display-line-numbers-mode code))
+            (should-not (memq #'display-line-numbers-mode prog-mode-hook)))
+        (kill-buffer code)
+        (kill-buffer text)))))
 
 ;;;; genie-pipeline: a wish file is accepted only if it can be taken back
 

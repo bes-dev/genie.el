@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -70,6 +70,7 @@
 (require 'tabulated-list)
 (require 'project)
 (require 'genie-acp)
+(require 'genie-markdown)
 (require 'genie-tools)
 
 (defgroup genie nil
@@ -97,13 +98,26 @@ Off, the header line only says that it is thinking."
 A link opens the first NAME.md found under any of them."
   :type '(repeat directory) :group 'genie)
 
-(defface genie-chat-code '((t :inherit (font-lock-constant-face fixed-pitch)))
-  "Face for code in an answer: inline, and in fenced blocks."
-  :group 'genie)
-
 (defface genie-chat-said '((t :inherit bold))
   "Face for what the person said, in the transcript."
   :group 'genie)
+
+(defface genie-chat-accent '((t :inherit font-lock-keyword-face))
+  "Face for the bar beside what the person said, and for a turn in flight."
+  :group 'genie)
+
+(defface genie-chat-tool '((t :inherit shadow))
+  "Face for the line that stands for a tool call."
+  :group 'genie)
+
+(defface genie-chat-note '((t :inherit (italic shadow)))
+  "Face for asides: what happened that is not the conversation itself."
+  :group 'genie)
+
+(defconst genie-chat--indent "  "
+  "What every line of the transcript is set in by.
+It is laid beside the text, not written into it: what is copied out of
+a chat is what was said.")
 
 (defvar-local genie-chat--agent nil "The agent process of this chat.")
 (defvar-local genie-chat--session nil "The conversation this chat shows.")
@@ -119,8 +133,10 @@ A link opens the first NAME.md found under any of them."
   "Non-nil while the context is being summarized.")
 (defvar-local genie-chat--children nil
   "Ids of the agents this conversation started that are still working.")
-(defvar-local genie-chat--answer-start nil
-  "Marker where the answer of the turn in flight begins, once it has.")
+(defvar-local genie-chat--pen nil
+  "Marker where the answer being written is not dressed yet, or nil.")
+(defvar-local genie-chat--fence nil
+  "Non-nil while the answer being written is inside a fenced block.")
 (defvar-local genie-chat--tail nil "Marker where the transcript grows.")
 (defvar-local genie-chat--input nil "Marker where the typed message begins.")
 (defvar-local genie-chat--calls nil "Tool call id → marker at its line.")
@@ -168,6 +184,8 @@ a new one.
 Killing the buffer ends its agent process; what was said stays in the
 conversation elmee keeps, and `genie-sessions' returns to it."
   (visual-line-mode 1)
+  (setq-local genie-markdown-page-function #'genie-chat--open-page
+              line-spacing 0.15)
   (setq-local header-line-format '(:eval (genie-chat--header)))
   (add-hook 'completion-at-point-functions #'genie-chat--complete-skill nil t)
   (add-hook 'kill-buffer-hook #'genie-chat--shutdown nil t))
@@ -210,25 +228,28 @@ turn ends."
           genie-chat--calls (make-hash-table :test #'equal)
           genie-chat--busy nil genie-chat--thinking nil
           genie-chat--compacting nil genie-chat--children nil
-          genie-chat--answer-start nil
+          genie-chat--pen nil genie-chat--fence nil
           genie-chat--plan nil genie-chat--attached nil
           genie-chat--said nil genie-chat--recall nil)
     (genie-chat--stop-clock)
     (when intro
       (genie-chat--insert
+       (format "🧞 %s\n" (file-name-nondirectory
+                          (directory-file-name genie-chat--directory)))
+       'genie-markdown-heading)
+      (genie-chat--insert
        ;; Spelled out rather than looked up: `C-c C-m' would be shown as
        ;; `C-c RET', which is the same key and reads like a different one.
-       "RET sends · C-j newline · M-p earlier messages · C-c C-/ skills · \
-C-c C-s past conversations · C-c C-m model · C-c C-r go back\n"
-       'shadow))
+       "RET sends · C-j a new line · TAB completes a /skill · \
+C-c C-r goes back · C-h m the rest\n"
+       'genie-chat-note))
     (goto-char (point-max))
     (insert (propertize "\n❯ " 'face 'minibuffer-prompt
                         'read-only t 'rear-nonsticky t 'front-sticky t))
     (setq genie-chat--input (point-marker))))
 
 (defun genie-chat--replayed (note)
-  "Dress the transcript a conversation was just played back into; add NOTE."
-  (genie-chat--dress (point-min) genie-chat--tail)
+  "End the playing back of a conversation into this chat; add NOTE."
   (genie-chat-note note)
   (goto-char (point-max)))
 
@@ -295,14 +316,47 @@ The buffer is emptied; a resumed conversation is played back into it."
     (genie-acp-shutdown genie-chat--agent)))
 
 (defun genie-chat--header ()
-  "Return the header line: the subject, the model, and the state of things."
+  "Return the header line: the subject, then the state of things."
   (let* ((model (plist-get (genie-chat--option "model") :currentValue))
          (plan genie-chat--plan)
          (step (cl-find "in_progress" plan :test #'equal
                         :key (lambda (entry) (plist-get entry :status))))
          (done (cl-count "completed" plan :test #'equal
-                         :key (lambda (entry) (plist-get entry :status)))))
-    (concat
+                         :key (lambda (entry) (plist-get entry :status))))
+         (quiet (lambda (text) (propertize text 'face 'shadow)))
+         (parts
+          (delq
+           nil
+           (list
+            ;; What is happening now comes first: it is what a glance is
+            ;; for, and a long plan step must not push it off the edge.
+            (when genie-chat--busy
+              (concat
+               (propertize
+                (format "%s %ds"
+                        (cond (genie-chat--compacting "making room")
+                              (genie-chat--thinking "thinking")
+                              (t "working"))
+                        (floor (float-time (time-since genie-chat--busy))))
+                'face 'genie-chat-accent)
+               (funcall quiet "  RET steers, C-c C-k stops")))
+            (and genie-chat--children
+                 (format "%d helping" (length genie-chat--children)))
+            (and plan (format "plan %d/%d%s" done (length plan)
+                              (if step (concat ": " (plist-get step :content))
+                                "")))
+            (and genie-chat--attached
+                 (format "📎 %s" (mapconcat #'car genie-chat--attached ", ")))
+            (and model (funcall quiet model))
+            (pcase genie-chat--usage
+              (`(,(and used (pred numberp))
+                 . ,(and size (pred numberp) (pred (< 0))))
+               (funcall quiet (format "%d%% of context"
+                                      (/ (* 100 used) size)))))))))
+    ;; A header line reads `%' as the start of a construct of its own.
+    (string-replace
+     "%" "%%"
+     (concat
      " 🧞 "
      (propertize (truncate-string-to-width
                   (car (split-string
@@ -312,24 +366,8 @@ The buffer is emptied; a resumed conversation is played back into it."
                         "\n"))
                   48 nil nil "…")
                  'face 'bold)
-     ;; What is happening now comes first: it is what a glance is for, and
-     ;; a long plan step must not push it off the edge.
-     (when genie-chat--busy
-       (format "  ·  %s %ds (RET steers, C-c C-k stops)"
-               (cond (genie-chat--compacting "making room")
-                     (genie-chat--thinking "thinking")
-                     (t "working"))
-               (floor (float-time (time-since genie-chat--busy)))))
-     (and genie-chat--children
-          (format "  ·  %d helping" (length genie-chat--children)))
-     (and model (format "  ·  %s" model))
-     (pcase genie-chat--usage
-       (`(,(and used (pred numberp)) . ,(and size (pred numberp) (pred (< 0))))
-        (format "  ·  %d%% of context" (/ (* 100 used) size))))
-     (and genie-chat--attached
-          (format "  ·  📎 %s" (mapconcat #'car genie-chat--attached ", ")))
-     (and plan (format "  ·  plan %d/%d%s" done (length plan)
-                       (if step (concat ": " (plist-get step :content)) ""))))))
+     (mapconcat (lambda (part) (concat (funcall quiet "  ·  ") part))
+                parts "")))))
 
 (defun genie-chat--start-clock ()
   "Redraw the header every second for the length of a turn."
@@ -353,24 +391,58 @@ The buffer is emptied; a resumed conversation is played back into it."
 
 ;;;; Writing into the transcript
 
-(defun genie-chat--insert (text &optional face)
+(defun genie-chat--insert (text &optional face prefix)
   "Add TEXT (in FACE) to the transcript, above the prompt.
-The window keeps following the conversation unless it was scrolled away."
+Its lines are set in by PREFIX, by default `genie-chat--indent'.  The
+window keeps following the conversation unless it was scrolled away."
   (let* ((inhibit-read-only t)
+         (prefix (or prefix genie-chat--indent))
          (window (get-buffer-window (current-buffer) t))
          (follow (and window (>= (window-point window) genie-chat--tail))))
     (save-excursion
       (goto-char genie-chat--tail)
       (insert (apply #'propertize text 'read-only t 'front-sticky t
+                     'line-prefix prefix 'wrap-prefix prefix
                      (and face (list 'face face))))
       (set-marker genie-chat--tail (point)))
     (when (and follow (< (window-point window) genie-chat--input))
       (set-window-point window genie-chat--tail))))
 
+(defun genie-chat--dress (&optional all)
+  "Dress the lines of the answer being written that are finished.
+With ALL, the line still being written too: nothing more is coming."
+  (when genie-chat--pen
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char genie-chat--pen)
+        (while (and (< (point) genie-chat--tail)
+                    (or all (save-excursion
+                              (search-forward "\n" genie-chat--tail t))))
+          (let ((end (min (line-end-position) genie-chat--tail)))
+            (setq genie-chat--fence
+                  (genie-markdown-line (point) end genie-chat--fence
+                                       genie-chat--directory genie-chat--indent))
+            (goto-char (min (1+ end) genie-chat--tail))))
+        (set-marker genie-chat--pen (point))))))
+
 (defun genie-chat--fresh-line ()
-  "Make sure the transcript ends at the start of a line."
+  "Make sure the transcript ends at the start of a line.
+Whatever is written next is not the answer: the answer so far is done,
+and stands apart from what follows it."
+  (let ((answered genie-chat--pen))
+    (genie-chat--dress t)
+    (setq genie-chat--pen nil genie-chat--fence nil)
+    (unless (or (= genie-chat--tail (point-min))
+                (eq (char-before genie-chat--tail) ?\n))
+      (genie-chat--insert "\n"))
+    (when answered (genie-chat--blank-line))))
+
+(defun genie-chat--blank-line ()
+  "Make sure the transcript ends in an empty line, unless it is empty."
   (unless (or (= genie-chat--tail (point-min))
-              (eq (char-before genie-chat--tail) ?\n))
+              (equal (buffer-substring (max (point-min) (- genie-chat--tail 2))
+                                       genie-chat--tail)
+                     "\n\n"))
     (genie-chat--insert "\n")))
 
 (defun genie-chat-note (text &optional face buffer)
@@ -379,30 +451,35 @@ It is shown in FACE, by default the one for things that are not the
 conversation itself."
   (with-current-buffer (or buffer (current-buffer))
     (genie-chat--fresh-line)
-    (genie-chat--insert text (or face 'shadow))))
+    (genie-chat--insert text (or face 'genie-chat-note))))
 
 (defun genie-chat--on-user (text)
   "Show TEXT as something the person said."
   (push text genie-chat--said)
   (genie-chat--fresh-line)
-  (genie-chat--insert "\n❯ " 'minibuffer-prompt)
-  (genie-chat--insert text 'genie-chat-said)
-  (genie-chat--insert "\n\n"))
+  (genie-chat--blank-line)
+  (genie-chat--insert (concat text "\n") 'genie-chat-said
+                      (propertize "▎ " 'face 'genie-chat-accent))
+  (genie-chat--insert "\n"))
 
 (defun genie-chat--on-text (delta)
-  "Stream answer DELTA, swallowing the blank chunks around tool activity."
-  (let ((leading (not genie-chat--answer-start)))
+  "Stream answer DELTA, swallowing the blank chunks around tool activity.
+Each line is dressed as it is finished, so the answer reads as it will
+read while it is still arriving."
+  (let ((leading (not genie-chat--pen)))
     (setq genie-chat--thinking nil)
     (when (and leading (not (string-empty-p (string-trim delta))))
       (genie-chat--fresh-line)
-      (setq genie-chat--answer-start (copy-marker genie-chat--tail)))
-    (genie-chat--insert (if leading (string-trim-left delta) delta))))
+      (genie-chat--blank-line)
+      (setq genie-chat--pen (copy-marker genie-chat--tail)))
+    (genie-chat--insert (if leading (string-trim-left delta) delta))
+    (genie-chat--dress)))
 
 (defun genie-chat--on-thought (delta)
   "Note that the model is reasoning; show DELTA when that is asked for."
   (setq genie-chat--thinking t)
   (when genie-chat-show-thoughts
-    (genie-chat--insert delta 'shadow)))
+    (genie-chat--insert delta 'genie-chat-note)))
 
 (defun genie-chat--on-tool (call)
   "Log tool CALL as a line that its ending will finish."
@@ -410,20 +487,33 @@ conversation itself."
   (genie-chat--fresh-line)
   (puthash (plist-get call :toolCallId) (copy-marker genie-chat--tail)
            genie-chat--calls)
-  (genie-chat--insert (format "⏳ %s\n" (genie-chat--call-title call)) 'shadow))
+  (genie-chat--insert (format "◦ %s\n" (genie-chat--call-title call))
+                      'genie-chat-tool))
 
 (defun genie-chat--call-title (call)
   "Return the line that stands for tool CALL in the transcript.
-A call into this Emacs reads as one: what was asked of it, and with what."
-  (let ((title (or (plist-get call :title) (plist-get call :kind) "tool")))
-    (if (string-match "\\`mcp__emacs__\\(.*\\)" title)
-        (format "emacs %s %s" (match-string 1 title)
-                (truncate-string-to-width
-                 (car (split-string
-                       (format "%s" (or (cadr (plist-get call :rawInput)) ""))
-                       "\n"))
-                 60 nil nil "…"))
-      title)))
+It says what is being done rather than which tool does it: a command as
+typed, a file by its name here, a question to this Emacs as one."
+  (let* ((title (or (plist-get call :title) (plist-get call :kind) "tool"))
+         (input (plist-get call :rawInput))
+         (files (mapconcat
+                 (lambda (location)
+                   (file-relative-name (plist-get location :path)
+                                       genie-chat--directory))
+                 (plist-get call :locations) ", "))
+         (line (lambda (text)
+                 (truncate-string-to-width
+                  (car (split-string (format "%s" (or text "")) "\n"))
+                  72 nil nil "…"))))
+    (cond
+     ((string-match "\\`mcp__emacs__\\([^ ]*\\)" title)
+      (format "λ %s %s" (match-string 1 title) (funcall line (cadr input))))
+     ((plist-get input :command)
+      (format "$ %s" (funcall line (plist-get input :command))))
+     ((and (member (plist-get call :kind) '("read" "edit" "delete" "move"))
+           (not (string-empty-p files)))
+      (format "%s %s" (plist-get call :kind) files))
+     (t (funcall line title)))))
 
 (defun genie-chat--on-tool-update (call)
   "Mark the line of tool CALL with how it ended.
@@ -434,17 +524,21 @@ part of a tool's output worth reading without being asked."
           (inhibit-read-only t))
       (save-excursion
         (goto-char at)
-        (when (looking-at "⏳")
+        (when (looking-at "◦")
           (replace-match (propertize (if failed "✗" "✓")
-                                     'face (if failed 'error 'shadow)
-                                     'read-only t 'front-sticky t)
+                                     'face (if failed 'error 'success)
+                                     'read-only t 'front-sticky t
+                                     'line-prefix genie-chat--indent
+                                     'wrap-prefix genie-chat--indent)
                          t t))
         (when failed
           (when-let* ((said (genie-chat--call-output call)))
             (forward-line 1)
             (let ((at-tail (= (point) genie-chat--tail)))
               (insert (propertize (format "  %s\n" said)
-                                  'face 'error 'read-only t 'front-sticky t))
+                                  'face 'error 'read-only t 'front-sticky t
+                                  'line-prefix genie-chat--indent
+                                  'wrap-prefix genie-chat--indent))
               ;; Written at the very end, it is part of the transcript the
               ;; next output must follow rather than precede.
               (when at-tail (set-marker genie-chat--tail (point))))))))))
@@ -504,13 +598,13 @@ SEVERITY is the agent's word for how much it matters."
   "End the turn in flight, which stopped because of STOP.
 STOP is the agent's stop reason, or `failed' or `exited'."
   (when genie-chat--busy
-    (setq genie-chat--busy nil genie-chat--thinking nil
-          genie-chat--compacting nil)
-    (genie-chat--stop-clock)
-    (when (and genie-chat--answer-start
-               (< genie-chat--answer-start genie-chat--tail))
-      (genie-chat--dress genie-chat--answer-start genie-chat--tail))
-    (genie-chat--fresh-line)
+    (let ((took (floor (float-time (time-since genie-chat--busy)))))
+      (setq genie-chat--busy nil genie-chat--thinking nil
+            genie-chat--compacting nil)
+      (genie-chat--stop-clock)
+      (genie-chat--fresh-line)
+      (when (> took 4)                  ; a quick answer needs no stopwatch
+        (genie-chat-note (format "· %ds\n" took))))
     (pcase stop
       ("cancelled" (genie-chat-note "— stopped —\n"))
       ("max_turn_requests"
@@ -523,23 +617,7 @@ STOP is the agent's stop reason, or `failed' or `exited'."
         (message "🧞 %s: %s" (buffer-name)
                  (if (equal stop "end_turn") "answered" "stopped"))))))
 
-;;;; Dressing an answer: light markdown, and things to click
-
-(define-button-type 'genie-chat-file
-  'follow-link t 'help-echo "Open this file"
-  'action (lambda (button)
-            (find-file-other-window (button-get button 'file))
-            (when-let* ((line (button-get button 'line)))
-              (goto-char (point-min))
-              (forward-line (1- line)))))
-
-(define-button-type 'genie-chat-url
-  'follow-link t 'help-echo "Open this in a browser"
-  'action (lambda (button) (browse-url (button-get button 'url))))
-
-(define-button-type 'genie-chat-wikilink
-  'follow-link t 'help-echo "Open this page"
-  'action (lambda (button) (genie-chat--open-page (button-get button 'page))))
+;;;; Pages an answer links to
 
 (defun genie-chat--open-page (name)
   "Open the wiki page NAME, found under `genie-chat-wiki-roots'."
@@ -553,51 +631,6 @@ STOP is the agent's stop reason, or `failed' or `exited'."
     (if found
         (find-file-other-window found)
       (user-error "No page %s under `genie-chat-wiki-roots'" name))))
-
-(defun genie-chat--dress (beg end)
-  "Render the markdown between BEG and END lightly, and make links of it.
-Headings, **bold**, `code` and fenced blocks get faces; a path to a
-file that exists, a URL and a [[wikilink]] become buttons.  The text
-itself is left as written."
-  (let ((inhibit-read-only t) (end (copy-marker end)))
-    (save-excursion
-      (cl-flet ((each (regexp function)
-                  (goto-char beg)
-                  (while (re-search-forward regexp end t)
-                    (save-match-data (funcall function)))))
-        (each "^#+ .*$"
-              (lambda () (add-face-text-property
-                          (match-beginning 0) (match-end 0) 'bold)))
-        (each "\\*\\*\\([^*\n]+\\)\\*\\*"
-              (lambda () (add-face-text-property
-                          (match-beginning 1) (match-end 1) 'bold)))
-        (each "`\\([^`\n]+\\)`"
-              (lambda () (add-face-text-property
-                          (match-beginning 1) (match-end 1) 'genie-chat-code)))
-        (each "^```.*\n\\(\\(?:.*\n\\)*?\\)```"
-              (lambda () (add-face-text-property
-                          (match-beginning 1) (match-end 1) 'genie-chat-code)))
-        (each "https?://[^ \t\n<>\"')]+[^ \t\n<>\"').,;:!?]"
-              (lambda () (make-text-button
-                          (match-beginning 0) (match-end 0)
-                          'type 'genie-chat-url
-                          'url (match-string-no-properties 0))))
-        (each "\\[\\[\\([^]|\n]+\\)\\(?:|[^]\n]*\\)?\\]\\]"
-              (lambda () (make-text-button
-                          (match-beginning 0) (match-end 0)
-                          'type 'genie-chat-wikilink
-                          'page (match-string-no-properties 1))))
-        (each "\\(?:^\\|[ \t(`\"']\\)\\(\\(?:~\\|\\.\\{0,2\\}\\)?/[^ \t\n`\"'()<>:,;]+\\)\\(?::\\([0-9]+\\)\\)?"
-              (lambda ()
-                (let ((file (expand-file-name (match-string-no-properties 1)
-                                              genie-chat--directory)))
-                  (when (file-exists-p file)
-                    (make-text-button
-                     (match-beginning 1) (or (match-end 2) (match-end 1))
-                     'type 'genie-chat-file 'file file
-                     'line (and (match-string 2)
-                                (string-to-number (match-string 2))))))))))
-    (set-marker end nil)))
 
 ;;;; Turns
 
@@ -622,7 +655,7 @@ Whatever was attached with `genie-ask' goes with it."
           (genie-chat-note (format "📎 %s\n" (car item)))))
       (setq genie-chat--busy (current-time) genie-chat--thinking nil
             genie-chat--recall nil
-            genie-chat--answer-start nil
+            genie-chat--pen nil genie-chat--fence nil
             genie-chat--attached nil)
       (genie-chat--start-clock)
       (force-mode-line-update)

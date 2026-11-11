@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.16.0] — 2026-11-11
+
+- **A wish holds the moment it is applied.** A function a wish adds to a
+  mode's hook also runs in the buffers already in that mode, and a minor
+  mode it switched on there is switched off again when the wish is. A
+  package installed during validation is known to the running session
+  before the wish that needs it is switched on, with no second install.
+- **The chat, redrawn.** What you said stands out by a bar and weight; the
+  transcript is set in from the edge without a character added to it. An
+  answer is dressed as it streams (`genie-markdown.el`): headings,
+  emphasis, bullets, quotations, links, and code blocks set apart by a
+  side rule, with the marks hidden rather than removed. A tool call reads
+  as what is done — `$ make test`, `edit src/a.el`, `λ describe C-c d`.
+  The header puts the state of the turn first; a turn that took a while
+  says how long.
+- Fixed: `%` in the header line was read as a mode-line construct, so
+  "11% of context" lost its sign.
+- Faces: `genie-chat-accent`, `genie-chat-tool`, `genie-chat-note`,
+  `genie-markdown-heading`, `-code`, `-block`, `-quote`, `-rule`.
+  `genie-chat-code` is now `genie-markdown-code`.
+
 ## [0.15.0] — 2026-11-11
 
 A new architecture: wishes that can be taken back, a genie that chooses the

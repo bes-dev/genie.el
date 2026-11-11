@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -48,6 +48,7 @@
 (require 'cl-lib)
 (require 'subr-x)
 (require 'diff-mode)
+(require 'package)
 (require 'genie-wish)
 (require 'genie-live)
 (require 'genie-chat)
@@ -250,7 +251,8 @@ effects until a library is loaded. Never use `setq', `global-set-key', \
 `define-key', `add-hook', `advice-add' or a bare mode call at the top \
 level of a wish file: they cannot be taken back, and the change will be \
 returned to you. Install a package with a top-level `(use-package NAME \
-:ensure t :defer t)' and nothing else in it. The docstring of the wish \
+:ensure t :defer t)' — or this configuration's own spelling, such as \
+`:straight t' — and nothing else in it. The docstring of the wish \
 is what the user asked for, in their words.
 
 Emacs runs Lisp on the one thread that reads keys and draws the screen. \
@@ -435,8 +437,9 @@ nothing was changed"
   "Forms whose bodies run where they stand, and so are checked like them.")
 
 (defconst genie--inert-keywords
-  '(:ensure :defer :demand :commands :vc :pin :load-path :after :if :when
-    :unless :requires :no-require :autoload :functions :defines :disabled)
+  '(:ensure :straight :elpaca :defer :demand :commands :vc :pin :load-path
+    :after :if :when :unless :requires :no-require :autoload :functions
+    :defines :disabled)
   "What a `use-package' form in a wish file may say: where a package is from.")
 
 (defconst genie--heavy
@@ -648,6 +651,10 @@ definitions — and one that fails to load offers a restart."
          (init (member "init.el" rest))
          (ordered (append (remove "init.el" rest) (and init '("init.el"))))
          failed)
+    ;; Validation ran in another Emacs: a package it installed is on disk,
+    ;; and this session has to be told before a wish asks for it.
+    (when (and wishes (bound-and-true-p package--initialized))
+      (package-initialize))
     (dolist (file wishes)
       (let ((path (expand-file-name file root)))
         (if (file-exists-p path)

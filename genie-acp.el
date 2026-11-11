@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.15.0
+;; Version: 0.16.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -172,7 +172,7 @@ at startup has a readable reason."
        :clientCapabilities (:elicitation (:form nil)
                             :session (:compaction nil :notices nil)
                             :subagents nil)
-       :clientInfo (:name "genie.el" :version "0.14.0"))
+       :clientInfo (:name "genie.el" :version "0.16.0"))
      (lambda (result err)
        (if err
            (genie-acp--fail-all agent (genie-acp--reason err "initialize refused"))
