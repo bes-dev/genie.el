@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -98,16 +98,9 @@ good, \\[genie] makes a new one."
   (message "t switches off or on · e what it changed · RET its file · d forgets · w a new wish"))
 
 (defun genie-lamp--wish ()
-  "Return the wish at point, as `genie-wish-list' gives it."
+  "Return the wish at point, as `genie-wish-list' gives it now."
   (let ((name (or (tabulated-list-get-id) (user-error "No wish here"))))
     (cl-find name (genie-wish-list) :key (lambda (wish) (plist-get wish :name)))))
-
-(defun genie-lamp--commit (subject &rest files)
-  "Commit FILES of the configuration as SUBJECT, for `genie-undo' to take back."
-  (let ((subject (format "genie: %s" subject)))
-    (apply #'genie--git "add" "-A" "--" files)
-    (apply #'genie--git "commit" "-q" "-m" subject "--" files)
-    (push (cons 'wish subject) genie--journal)))
 
 (defun genie-lamp-visit ()
   "Open the file of the wish at point."
@@ -117,14 +110,21 @@ good, \\[genie] makes a new one."
 (defun genie-lamp-toggle ()
   "Switch the wish at point off, or back on, and keep it so."
   (interactive)
-  (let* ((wish (genie-lamp--wish))
-         (name (plist-get wish :name))
-         (on (not (eq (plist-get wish :state) 'on))))
+  (genie--require-idle)
+  (let* ((name (plist-get (genie-lamp--wish) :name))
+         (on (not (eq (plist-get (genie-lamp--wish) :state) 'on))))
     (genie-wish-keep name on)
-    (genie-lamp--commit (format "switch %s %s" name (if on "on" "off"))
-                        (genie-wish--off-file))
+    (genie--commit (format "switch %s %s" name (if on "on" "off"))
+                   (list (genie-wish-off-file)))
     (revert-buffer)
-    (message "🧞 %s is %s" name (if on "on" "off — what it changed is as it was"))))
+    ;; What it is now, not what was asked for: a wish that signals when it
+    ;; is switched on is not on.
+    (message "🧞 %s"
+             (pcase (plist-get (genie-lamp--wish) :state)
+               ('on (format "%s is on" name))
+               ('broken (format "%s could not be switched on: %s" name
+                                (plist-get (genie-lamp--wish) :error)))
+               (_ (format "%s is off — what it changed is as it was" name))))))
 
 (defun genie-lamp-effects ()
   "Show what the wish at point has changed in this Emacs."
@@ -151,11 +151,12 @@ good, \\[genie] makes a new one."
   (interactive)
   (let* ((wish (genie-lamp--wish))
          (file (plist-get wish :file)))
+    (genie--require-idle)
     (when (yes-or-no-p (format "Forget the wish %s for good? "
                                (plist-get wish :name)))
       (genie-wish-forget-file file)
       (delete-file file)
-      (genie-lamp--commit (format "forget %s" (plist-get wish :name)) file)
+      (genie--commit (format "forget %s" (plist-get wish :name)) (list file))
       (revert-buffer))))
 
 (provide 'genie-lamp)

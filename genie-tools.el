@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: lisp, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -99,8 +99,11 @@
 (defun genie-tools--describe (args)
   "Say what the symbol or the key named in ARGS is in this session."
   (let* ((key (plist-get args :key))
-         (bound (and key (genie-tools--in-place
-                          (lambda () (key-binding (kbd key))))))
+         (place (plist-get genie-live--place :buffer))
+         ;; Asked of the buffer the wish was made in, without going there.
+         (bound (and key (with-current-buffer (if (buffer-live-p place) place
+                                                (current-buffer))
+                           (key-binding (kbd key)))))
          (symbol (if key bound (intern-soft (or (plist-get args :symbol) ""))))
          (said (delq nil
                      (list (and key (format "%s runs %s." key (or bound "nothing")))
@@ -152,6 +155,7 @@
                    (find-library-name (file-name-base file)))))
     (with-temp-buffer
       (insert-file-contents source)
+      (set-syntax-table emacs-lisp-mode-syntax-table)
       (goto-char (point-min))
       (unless (re-search-forward
                (format "^(\\(?:cl-\\)?def[a-z-]* +%s\\_>"
@@ -179,21 +183,25 @@
                 (format "\n\n*Warnings*\n%s" warnings)
               ""))))
 
-(defun genie-tools--in-place (function)
-  "Call FUNCTION where the last wish was made, or here if that is gone."
-  (if (buffer-live-p (plist-get genie-live--place :buffer))
-      (genie-live-at genie-live--place function)
-    (funcall function)))
-
 (defun genie-tools--eval (args)
-  "Run the Lisp in ARGS where the last wish was made; return what it gave."
-  (let ((code (plist-get args :code)))
+  "Run the Lisp in ARGS where the last wish was made; return what it gave.
+If the person is still where they asked, the code may move their cursor
+— \"go to the end\" is a fair wish.  If they have moved on in that
+buffer since, their point and mark are left where they are now: the
+code acts where the wish was made, and nothing jumps under their hands."
+  (let* ((code (plist-get args :code))
+         (place genie-live--place)
+         (run (lambda ()
+                (let ((value (cdr (genie-live-call
+                                   "eval" (lambda () (genie-live-eval code))))))
+                  (format "=> %S\n(ran in buffer %s)" value (buffer-name))))))
     (genie-live-screen code)
-    (genie-tools--in-place
-     (lambda ()
-       (let ((value (cdr (genie-live-call
-                          "eval" (lambda () (genie-live-eval code))))))
-         (format "=> %S\n(ran in buffer %s)" value (buffer-name)))))))
+    (if (buffer-live-p (plist-get place :buffer))
+        (with-current-buffer (plist-get place :buffer)
+          (if (= (point) (plist-get place :point))
+              (genie-live-at place run)
+            (save-mark-and-excursion (genie-live-at place run))))
+      (funcall run))))
 
 (defun genie-tools--tool (name description properties required function
                                &optional acting)

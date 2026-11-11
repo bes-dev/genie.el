@@ -12,8 +12,11 @@ set -euo pipefail
 
 EMACS_D="${EMACS_D:-$HOME/.emacs.d}"
 
-if [ -e "$EMACS_D/init.el" ] || [ -e "$HOME/.emacs" ]; then
-  echo "genie: $EMACS_D/init.el (or ~/.emacs) already exists — refusing to touch a living config." >&2
+# Emacs reads the first of these it finds, so a config in any of them is a
+# living one — and a new ~/.emacs.d would be read instead of ~/.config/emacs.
+if [ -e "$EMACS_D/init.el" ] || [ -e "$HOME/.emacs" ] || [ -e "$HOME/.emacs.el" ] ||
+   { [ "$EMACS_D" = "$HOME/.emacs.d" ] && [ -e "${XDG_CONFIG_HOME:-$HOME/.config}/emacs" ]; }; then
+  echo "genie: an Emacs configuration already exists here — refusing to touch a living config." >&2
   echo "genie: to try the empty-lamp experiment anyway: EMACS_D=/tmp/lamp $0 && emacs --init-directory /tmp/lamp" >&2
   exit 1
 fi
@@ -64,9 +67,33 @@ cat > "$EMACS_D/wishes/genie-keys.el" <<'EOF'
   (genie-key global-map "C-c g" 'genie-command-map))
 EOF
 
+# What Emacs writes for itself is not configuration, and not git's to keep.
+cat > "$EMACS_D/.gitignore" <<'EOF'
+# What Emacs and its packages write for themselves; not configuration.
+/elpa/
+/eln-cache/
+/straight/
+/elpaca/
+/auto-save-list/
+/transient/
+/url/
+/.cache/
+/tramp
+/recentf
+/places
+/history
+/savehist
+/bookmarks
+/projects
+/network-security.data
+*.elc
+*~
+\#*#
+EOF
+
 # Wishes are commits: the config root must be a git repository.
 git -C "$EMACS_D" init -q
-git -C "$EMACS_D" add init.el wishes/genie-keys.el
+git -C "$EMACS_D" add .gitignore init.el wishes/genie-keys.el
 git -C "$EMACS_D" commit -qm "genie: an empty lamp" ||
   git -C "$EMACS_D" -c user.name=genie -c user.email=genie@localhost \
       commit -qm "genie: an empty lamp"

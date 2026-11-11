@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -71,6 +71,7 @@
 (require 'genie-wish)
 (require 'genie-live)
 (require 'genie-chat)
+(require 'genie-sessions)
 (require 'genie-pipeline)
 (require 'genie-spell)
 (require 'genie-lamp)
@@ -105,7 +106,8 @@
   (when-let* ((chat (get-buffer genie-buffer)))
     (kill-buffer chat))
   (setq genie--cantrip-target nil genie--pending-register nil)
-  (genie--set-state 'idle))
+  (genie--busy 'spell nil)
+  (genie--abandon))
 
 (add-hook 'kill-emacs-hook #'genie--cleanup)
 
@@ -204,6 +206,30 @@ changed is put back as it was, nothing on disk is touched, and
 "
   "What init.el needs in order to start a configuration made of wishes.")
 
+(defconst genie--gitignore
+  "# What Emacs and its packages write for themselves; not configuration.
+/elpa/
+/eln-cache/
+/straight/
+/elpaca/
+/auto-save-list/
+/transient/
+/url/
+/.cache/
+/tramp
+/recentf
+/places
+/history
+/savehist
+/bookmarks
+/projects
+/network-security.data
+*.elc
+*~
+\\#*#
+"
+  "What `genie-setup' has git leave alone in a configuration with no rules yet.")
+
 (defconst genie--keys-wish
   ";;; genie-keys.el --- the first wish -*- lexical-binding: t; -*-
 
@@ -219,22 +245,41 @@ changed is put back as it was, nothing on disk is touched, and
 (defun genie-setup ()
   "Make this Emacs ready for wishes.
 The configuration in `genie-config-root' becomes a git repository if it
-is not one, init.el is made to load the wishes kept in its `wishes'
-directory, and the first wish puts genie on \\`C-c g'.  Safe to run
-again: it only adds what is missing."
+is not kept by git already, the init file is made to load the wishes
+kept in its `wishes' directory, git is told what Emacs writes for itself
+there, and the first wish puts genie on \\`C-c g'.  Safe to run again:
+it only adds what is missing."
   (interactive)
   (let* ((root (genie--root))
-         (init (expand-file-name "init.el" root))
          (home (file-equal-p root user-emacs-directory))
+         (init (or (genie--init-file)
+                   (and home (expand-file-name "init.el" root))
+                   (user-error "Genie: no init.el under %s — set \
+`genie-config-root' to the directory your init file is in"
+                               (abbreviate-file-name root))))
+         (ignore (expand-file-name ".gitignore" root))
          keys done touched)
+    ;; An init file elsewhere means Emacs would never read the one written
+    ;; here: better said now than found out at the next start.
+    (when (and user-init-file (not (genie--init-file))
+               (not (file-in-directory-p user-init-file root)))
+      (user-error "Genie: Emacs starts from %s, which is not under %s — move \
+it there as init.el, or set `genie-config-root' to where it is"
+                  (abbreviate-file-name user-init-file)
+                  (abbreviate-file-name root)))
     ;; The wishes are part of the configuration, wherever that is kept.
     (unless home
       (setq genie-wish-directory (expand-file-name "wishes" root)))
     (setq keys (expand-file-name "genie-keys.el" genie-wish-directory))
     (make-directory genie-wish-directory t)
-    (unless (file-directory-p (expand-file-name ".git" root))
+    ;; A directory of a larger repository is already kept by git.
+    (unless (genie--git-p "rev-parse" "--is-inside-work-tree")
       (genie--git "init" "-q")
       (push "a git repository" done))
+    (unless (file-exists-p ignore)
+      (write-region genie--gitignore nil ignore nil 'silent)
+      (push ignore touched)
+      (push "a .gitignore for what Emacs writes itself" done))
     (unless (and (file-exists-p init)
                  (with-temp-buffer
                    (insert-file-contents init)
@@ -253,15 +298,14 @@ be taken back.\n"
                 genie--bootstrap)
         (write-region nil nil init nil 'silent))
       (push init touched)
-      (push "init.el loads the wishes" done))
+      (push (format "%s loads the wishes" (file-name-nondirectory init)) done))
     (unless (file-exists-p keys)
       (write-region genie--keys-wish nil keys nil 'silent)
       (push keys touched)
       (push "genie on C-c g" done))
     ;; Only what setup wrote: the rest of the worktree is not its to commit.
     (when touched
-      (apply #'genie--git "add" "--" touched)
-      (apply #'genie--git "commit" "-q" "-m" "genie: setup" "--" touched)
+      (genie--commit "setup" touched)
       (genie-wish-load-file keys))
     (message "🧞 %s%s"
              (if done

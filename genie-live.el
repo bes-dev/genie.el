@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: lisp, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -72,16 +72,28 @@ anything."
 
 (defcustom genie-risky-functions
   '(shell-command shell-command-to-string async-shell-command
-    call-process call-process-region process-file start-process
-    start-process-shell-command make-process make-serial-process
-    make-network-process open-network-stream url-retrieve
-    url-retrieve-synchronously url-copy-file browse-url
-    delete-file delete-directory move-file-to-trash write-region
-    kill-emacs restart-emacs server-eval-at)
+    shell-command-on-region call-process call-process-region
+    call-process-shell-command process-file process-file-shell-command
+    process-lines start-process start-process-shell-command
+    start-file-process start-file-process-shell-command make-process
+    make-serial-process make-network-process open-network-stream
+    eshell-command compile term-exec
+    url-retrieve url-retrieve-synchronously url-copy-file
+    url-insert-file-contents browse-url
+    delete-file delete-directory move-file-to-trash rename-file copy-file
+    write-region write-file with-temp-file append-to-file
+    make-pipe-process set-file-modes dired-delete-file
+    kill-emacs save-buffers-kill-emacs restart-emacs server-eval-at)
   "Functions conjured code may only call after explicit confirmation.
 Code run in the live session is meant to act on buffers; anything
-reaching processes, the network, file deletion or Emacs's lifetime is
-screened before it is evaluated."
+reaching processes, the network, the file system or Emacs's lifetime is
+named before it is evaluated.
+
+This is a courtesy, not a sandbox.  The code is read for these names,
+and Lisp has more ways to reach a function than naming it; the agent
+that wrote the code can also run a shell command without asking Emacs
+at all.  What the list buys is that code which says what it does is
+asked about when it does something you may not have meant."
   :type '(repeat symbol) :group 'genie)
 
 (defun genie--confirm-p (what)
@@ -139,17 +151,39 @@ here, so that code a person interrupted is reported rather than lost."
       (quit (error "Interrupted with C-g")))
     (cons forms value)))
 
+(defvar genie-live--waiting nil
+  "What is waiting for Emacs to be free, oldest first.")
+
+(defvar genie-live--timer nil
+  "The timer that will look again, while anything is waiting.")
+
+(defun genie-live--busy-p ()
+  "Return non-nil while a person is in the middle of something."
+  (or (active-minibuffer-window) executing-kbd-macro))
+
+(defun genie-live--drain ()
+  "Run what is waiting, in the order it came, for as long as Emacs is free."
+  (setq genie-live--timer nil)
+  (while (and genie-live--waiting (not (genie-live--busy-p)))
+    ;; A timer runs with quitting held off.  Nothing run from here may be
+    ;; something a person cannot stop.
+    (condition-case err
+        (let ((inhibit-quit nil))
+          (funcall (pop genie-live--waiting)))
+      (quit (message "🧞 interrupted"))
+      (error (message "🧞 %s" (error-message-string err)))))
+  (when genie-live--waiting
+    (setq genie-live--timer (run-at-time 0.5 nil #'genie-live--drain))))
+
 (defun genie-live-when-free (function)
   "Call FUNCTION from the event loop, once no minibuffer is in use.
 Never from the caller's own stack: what asks for code to be run is a
 process filter, where it would hold up the whole editor and could not
-be interrupted."
-  (run-at-time
-   0 nil
-   (lambda ()
-     (if (or (active-minibuffer-window) executing-kbd-macro)
-         (run-with-idle-timer 0.5 nil #'genie-live-when-free function)
-       (funcall function)))))
+be interrupted.  What is asked for first runs first, and a person can
+interrupt it like any command."
+  (setq genie-live--waiting (append genie-live--waiting (list function)))
+  (unless genie-live--timer
+    (setq genie-live--timer (run-at-time 0 nil #'genie-live--drain))))
 
 ;;;; Where it was asked for
 

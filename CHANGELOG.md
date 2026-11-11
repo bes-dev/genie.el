@@ -3,6 +3,78 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.17.0] — 2026-11-11
+
+An independent review of 0.16 found twenty-six defects. This release fixes
+them; each has a test that would have caught it.
+
+**Your work is safe.**
+- `genie-undo` no longer costs uncommitted edits: the worktree as it was
+  before a wish is kept beside its commit (`refs/genie/pre/…`) and is what
+  undo restores.
+- Only what is the agent's is committed or deleted: a wish file, the
+  manual, or a file an editing tool said it wrote. A package directory or
+  an auto-save that appeared during a turn is left alone. `genie-setup`
+  and `bootstrap.sh` write a `.gitignore`.
+- With nothing journaled this session, `genie-undo` always asks.
+
+**Taking back is exact.**
+- Wishes that change the same key, option or hook are taken back in
+  reverse order whichever is switched off, and the later ones switched on
+  again.
+- A part deferred with `genie-after` no longer outlives a wish that was
+  redefined or forgotten.
+- A change that signals halfway is still taken back; a minor mode a hook
+  switched on is switched off in buffers opened since, too.
+- A damaged `.off` file keeps nothing off; a wish is forgotten by the file
+  it is, however the path is spelled.
+
+**The one thread.**
+- Spells and cantrips are evaluated and cast from the event loop, not the
+  process filter; so is the applying of a wish. All can be interrupted.
+- Waiting for a free minibuffer no longer spins the CPU.
+- Tools leave your point and mark where they are.
+- An agent that dies before its first answer ends the turn and shows its
+  stderr; one failing handler no longer costs the lines that came with it.
+
+**Validation.**
+- The reading for what cannot be taken back is rewritten: only
+  definitions at the top level of a wish file, and inside a wish every
+  `setq`, `add-hook`, `define-key` and their kin at any depth, with
+  locally bound variables and mode predicates left alone.
+- The other Emacs is given this one's `user-emacs-directory`, its
+  `early-init.el` and its packages, so a config kept elsewhere validates.
+- That Emacs also compiles the wish files: a function called that does
+  not exist goes back to the agent instead of failing on the day it runs.
+- What could slow every keystroke is asked about before it is applied.
+
+**After a second look at the fixes.**
+- The compile check loads the libraries a wish names (`require`,
+  `genie-after`) first, reads only the wish files' own warnings, and
+  leaves nothing behind; `(genie-after 'org (genie-key org-mode-map …))`
+  passes.
+- A deferred part that lands later is taken back as the latest; a hook's
+  minor mode is switched off only where the wish switched it on, even if
+  the mode was an autoload then.
+- `eval` may move a cursor that is still where the wish was made.
+- What waits for a free minibuffer runs in the order it came, and can be
+  interrupted — the applying of a wish included.
+- What could slow Emacs is shown as a diff to apply or reject, not asked
+  in a prompt a stray key could answer.
+- Undo says so when a commit amended since can no longer give back
+  uncommitted edits.
+
+**The rest.**
+- Going back in a chat (`C-c C-r`, `C-c C-b`) works again with tools on.
+- A refused message stays typed. A failed tool call no longer takes the
+  next call's line. `**` inside code or a word is not emphasis.
+- The lamp reports what is, commits only when something changed, and
+  waits for a pending change.
+- `genie-setup` works for a config that is one directory of a larger
+  repository, and for an init file under another name.
+- A spell is not a turn: it no longer disturbs a diff under review.
+- `genie-validate.el` and `genie-sessions.el` are files of their own.
+
 ## [0.16.0] — 2026-11-11
 
 - **A wish holds the moment it is applied.** A function a wish adds to a

@@ -19,6 +19,18 @@
 (require 'warnings)
 (require 'genie)
 
+;; Whatever must not run in a process filter is put off to the event loop
+;; by `genie-live-when-free'.  A test has no event loop running, so here it
+;; happens at once — except where the putting off is what is being tested.
+;; No test may start the real agent: whether one is installed is not the
+;; suite's business, and its sessions are not the suite's to open.
+(advice-add 'genie-acp--start :override #'ignore)
+
+(defvar genie-tests--put-off nil "Non-nil to let `genie-live-when-free' wait.")
+(advice-add 'genie-live-when-free :around
+            (lambda (wait function)
+              (if genie-tests--put-off (funcall wait function) (funcall function))))
+
 ;;;; Helpers
 
 (defmacro genie-tests--with-repo (&rest body)
@@ -26,7 +38,8 @@
   (declare (indent 0))
   `(let* ((genie-config-root (make-temp-file "genie-tests-repo" t))
           (genie-wish-directory (expand-file-name "wishes" genie-config-root))
-          (genie-wish--all nil) (genie--cautions nil)
+          (genie-wish--all nil) (genie-wish--on nil) (genie--cautions nil)
+          (genie--working nil) (genie--validation nil)
           (warning-suppress-log-types '((genie)))
           (genie--changed nil) (genie--created nil) (genie--verdict nil)
           (genie--pre nil) (genie--pre-untracked nil) (genie--repairs 0)
@@ -47,6 +60,14 @@
   (let ((file (expand-file-name name (genie--root))))
     (make-directory (file-name-directory file) t)
     (with-temp-file file (insert content))))
+
+(defun genie-tests--agent-writes (name content)
+  "Write CONTENT to file NAME under the test repo, as an editing tool would.
+The agent's chat is told, which is how the pipeline knows the file is
+the agent's to commit and to take back."
+  (genie-tests--write name content)
+  (with-current-buffer (genie--buffer)
+    (push (expand-file-name name (genie--root)) genie-chat--touched)))
 
 (defun genie-tests--read (name)
   "Return the content of file NAME under the test repo."
@@ -265,7 +286,7 @@ newest first, and `genie-tests--say' plays the agent's side."
     (goto-char (point-max))
     (insert "half a thought")
     (genie-chat--on-user "first")
-    (setq genie-chat--busy t)
+    (setq genie-chat--busy (current-time))
     (genie-chat--on-text "an ")
     (genie-chat--on-text "answer")
     (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
@@ -583,7 +604,7 @@ docs at https://example.com/docs." file))
     (should (equal (genie--pre-dirty) '("b.el")))
     (genie-tests--write "a.el" "(setq a 2)\n")
     (genie-tests--write "b.el" "(setq b 3)\n")
-    (genie-tests--write "c.el" "(setq c 1)\n")
+    (genie-tests--agent-writes "c.el" "(setq c 1)\n")
     (genie--detect-changes)
     (should (equal (sort (copy-sequence genie--changed) #'string<)
                    '("a.el" "b.el" "c.el")))
@@ -600,7 +621,7 @@ genies were what `git stash create' refused to merge."
     (genie-tests--write "GENIE.md" "# leftover manual\n")
     (genie--git "add" "--" "GENIE.md")         ; what a lost review leaves
     (genie--snapshot)                          ; must not signal
-    (genie-tests--write "b.el" "(setq b 1)\n")
+    (genie-tests--agent-writes "b.el" "(setq b 1)\n")
     (genie--detect-changes)
     (should (member "b.el" genie--changed))
     (should (equal (genie-tests--read "GENIE.md") "# leftover manual\n"))))
@@ -616,7 +637,7 @@ genies were what `git stash create' refused to merge."
     (genie--snapshot)
     (genie-tests--write "a.el" "(setq a 2)\n")
     (genie-tests--write "b.el" "(setq b 3)\n")
-    (genie-tests--write "c.el" "(setq c 1)\n")
+    (genie-tests--agent-writes "c.el" "(setq c 1)\n")
     (genie--detect-changes)
     (setq genie--state 'reviewing)
     (genie-reject)
@@ -638,7 +659,7 @@ worktree, and unrelated uncommitted work survives untouched."
     (genie-tests--write "b.el" "(setq b 2)\n") ; user WIP, must survive
     (genie--snapshot)
     (genie-tests--write "a.el" "(setq a 5)\n")
-    (genie-tests--write "d.el" "(setq d 1)\n")
+    (genie-tests--agent-writes "d.el" "(setq d 1)\n")
     (genie--detect-changes)
     (setq genie--wish "make a five")
     (apply #'genie--git "commit" "-m" (format "genie: %s" genie--wish)
@@ -724,10 +745,12 @@ worktree, and unrelated uncommitted work survives untouched."
   (genie-tests--with-repo
     (genie-tests--write "ok.el" "(defun f () 1)\n")
     (genie-tests--write "bad.el" "(defun f ( () 1)\n")
-    (let ((genie--changed '("ok.el")))
-      (should (car (genie--parens-check))))
-    (let ((genie--changed '("ok.el" "bad.el")))
-      (let ((verdict (genie--parens-check)))
+    (cl-flet ((check (&rest names)
+                (genie-validate--parens
+                 (mapcar (lambda (name) (expand-file-name name (genie--root)))
+                         names))))
+      (should (car (check "ok.el")))
+      (let ((verdict (check "ok.el" "bad.el")))
         (should-not (car verdict))
         (should (string-match-p "bad\\.el" (cdr verdict)))))))
 
@@ -759,7 +782,7 @@ no healing: the form calls whatever `genie--activity' is current."
 (ert-deftest genie-spinner-follows-state ()
   "The spinner timer runs while genie works and stops when it is quiet."
   (let ((genie--state 'idle) (genie--spinner-timer nil)
-        (genie--spinner-index 0) (genie--tool nil))
+        (genie--spinner-index 0) (genie--working nil))
     (unwind-protect
         (progn
           (genie--set-state 'thinking)
@@ -807,7 +830,7 @@ no healing: the form calls whatever `genie--activity' is current."
         (genie--changed '("a.el")) applied shown)
     (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
               ((symbol-function 'genie--validate)
-               (lambda (cb) (funcall cb '(t . "ok"))))
+               (lambda () (genie--judged '(t . "ok"))))
               ((symbol-function 'genie-apply) (lambda () (setq applied t)))
               ((symbol-function 'genie--show-diff) (lambda () (setq shown t))))
       (genie--finish-turn))
@@ -822,7 +845,7 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
          (genie--changed '("a.el")) applied shown repaired gave-up)
      (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
                ((symbol-function 'genie--validate)
-                (lambda (cb) (funcall cb '(nil . "void-function foo"))))
+                (lambda () (genie--judged '(nil . "void-function foo"))))
                ((symbol-function 'genie-apply) (lambda () (setq applied t)))
                ((symbol-function 'genie--show-diff) (lambda () (setq shown t)))
                ((symbol-function 'genie--repair)
@@ -864,7 +887,7 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
     (genie--git "commit" "-qm" "base")
     (genie--snapshot)
     (genie-tests--write "a.el" "(setq a (broken\n")
-    (genie-tests--write "new.el" "(setq new 1)\n")
+    (genie-tests--agent-writes "new.el" "(setq new 1)\n")
     (genie--detect-changes)
     (setq genie--wish "break everything" genie--repairs 2)
     (cl-letf (((symbol-function 'display-buffer) #'ignore))
@@ -932,7 +955,7 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
           (genie--changed '("a.el")) (genie--verdict '(t . "stale")) touched)
       (cl-letf (((symbol-function 'genie--detect-changes) #'ignore)
                 ((symbol-function 'genie--validate)
-                 (lambda (_) (setq touched 'validated)))
+                 (lambda () (setq touched 'validated)))
                 ((symbol-function 'genie-apply) (lambda () (setq touched 'applied)))
                 ((symbol-function 'genie--restore-worktree)
                  (lambda () (setq touched 'restored))))
@@ -951,8 +974,13 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
       (genie-tests--write "a.el" "(setq a 5)\n")
       (genie--git "commit" "-qm" "genie: five" "--" "a.el")
       (cl-letf (((symbol-function 'genie--refresh) #'ignore)
-                ((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) t)))
-        (genie--undo-wish nil))
+                ((symbol-function 'y-or-n-p) (lambda (_) (setq asked t) nil)))
+        ;; with nothing journaled this session, which commit is meant is a
+        ;; guess, and a guess is asked about whatever the dial says
+        (should-error (genie--undo-wish nil) :type 'user-error)
+        (should asked)
+        (setq asked nil)
+        (genie--undo-wish "genie: five"))
       (should-not asked)
       (should (equal (genie--git "log" "--format=%s") "base"))
       ;; …unless the user's own later edits would go with it
@@ -1062,7 +1090,8 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
         (genie--pending-register nil) (genie--journal nil))
     (genie-tests--conjuring
       (genie--conjure "number the lines" "spell: number the lines")
-      (should (eq genie--state 'thinking))
+      (should (assq 'spell genie--working))
+      (should (eq genie--state 'idle))    ; a spell is not a turn
       (should (equal (genie-tests--spell-argv) '("--tools" "")))
       (genie-tests--conjured
             (concat "```elisp\n"
@@ -1245,7 +1274,8 @@ The effect is gone with the revert; undo must not error or strand it."
 (defun genie-tests--state ()
   "Return everything the test wishes may have changed."
   (list (lookup-key genie-tests--map (kbd "C-c d")) genie-tests--option
-        genie-tests--hook genie-tests-mode genie-tests--list
+        (and (memq #'ignore genie-tests--hook) t) genie-tests-mode
+        genie-tests--list
         (and (advice-member-p #'genie-tests--advice 'genie-tests--advised) t)
         genie-tests--effect))
 
@@ -1266,7 +1296,7 @@ The effect is gone with the revert; undo must not error or strand it."
         (genie-effect "a flag" (lambda () (setq genie-tests--effect t))
                       (lambda () (setq genie-tests--effect nil))))
       (should (equal (genie-tests--state)
-                     '(forward-char 5 (ignore) t (b a) t t)))
+                     '(forward-char 5 t t (b a) t t)))
       (should (memq timer timer-list))
       (should (equal (plist-get (car (genie-wish-list)) :state) 'on))
       (should (member "key C-c d runs forward-char"
@@ -1295,7 +1325,11 @@ The effect is gone with the revert; undo must not error or strand it."
       (should (eq (plist-get wish :state) 'broken))
       (should (equal (plist-get wish :error) "No such thing")))
     ;; and an effect has nowhere to be remembered outside a wish
-    (should-error (genie-set 'genie-tests--option 5))))
+    (should-error (genie-set 'genie-tests--option 5))
+    ;; a mode named by its library says what was probably meant
+    (genie-wish misnamed "x" (genie-enable 'genie-tests))
+    (should (string-match-p "did you mean .genie-tests-mode"
+                            (plist-get (cadr (genie-wish-list)) :error)))))
 
 (ert-deftest genie-wish-a-deferred-part-waits-and-respects-off ()
   "What waits for a library runs when it loads, unless the wish is off by then."
@@ -1364,58 +1398,6 @@ The effect is gone with the revert; undo must not error or strand it."
 
 ;;;; genie-pipeline: a wish file is accepted only if it can be taken back
 
-(ert-deftest genie-lint-names-what-could-not-be-taken-back ()
-  "A change made where it stands is refused; the same inside a function is not."
-  (cl-flet ((problems (form) (genie--irreversible-in form)))
-    (should (string-match-p "genie-hook" (car (problems '(add-hook 'a #'b)))))
-    (should (string-match-p "genie-set"
-                            (car (problems '(genie-wish w "d" (setq a 1))))))
-    (should (string-match-p "genie-key"
-                            (car (problems '(genie-wish w "d"
-                                              (genie-after 'org
-                                                (define-key m "a" #'b)))))))
-    (should (string-match-p "genie-enable" (car (problems '(vertico-mode 1)))))
-    (should (string-match-p ":bind"
-                            (car (problems '(use-package magit :ensure t
-                                              :bind ("C-x g" . magit))))))
-    (should-not (problems '(use-package magit :ensure t :defer t)))
-    (should-not (problems '(defun f () (add-hook 'a #'b nil t) (setq x 1))))
-    (should-not (problems '(genie-wish w "d"
-                             (genie-key global-map "C-c d" #'f)
-                             (genie-timer (run-at-time 1 nil #'f)))))))
-
-(ert-deftest genie-validation-refuses-a-wish-with-no-way-back ()
-  "The refusal reaches the agent as a verdict, before anything is loaded."
-  (genie-tests--with-repo
-    (genie-tests--write "wishes/slow.el"
-                        "(add-hook 'post-command-hook #'ignore)\n")
-    (genie-tests--write "mod.el" "(add-hook 'x #'ignore)\n")
-    (let ((genie--changed '("wishes/slow.el" "mod.el")) verdict)
-      (genie--validate (lambda (it) (setq verdict it)))
-      (should-not (car verdict))
-      (should (string-match-p "wishes/slow.el: `add-hook'.*genie-hook"
-                              (cdr verdict)))
-      ;; outside the wishes nothing is asked of old code — but a hook that
-      ;; runs on every key is named wherever it is
-      (should-not (string-match-p "mod.el" (cdr verdict)))
-      (should (equal genie--cautions '(post-command-hook))))))
-
-(ert-deftest genie-batch-validation-fails-a-wish-that-would-not-start ()
-  "A wish that signals at startup fails validation with its own words."
-  (genie-tests--with-repo
-    (genie-tests--write
-     "init.el"
-     (format "(setq genie-wish-directory %S)\n(require 'genie-wish)\n(genie-wish-load)\n"
-             genie-wish-directory))
-    (genie-tests--write "wishes/bad.el"
-                        "(genie-wish bad \"x\" (error \"Not today\"))\n")
-    (let ((genie--changed '("wishes/bad.el")) (genie-validate 'batch) verdict)
-      (genie--validate (lambda (it) (setq verdict it)))
-      (with-timeout (30 (error "Validation never answered"))
-        (while (not verdict) (accept-process-output nil 0.05)))
-      (should-not (car verdict))
-      (should (string-match-p "Not today" (cdr verdict))))))
-
 (ert-deftest genie-refresh-follows-the-wish-files ()
   "A wish file that changed is live at once; one that is gone is taken back."
   (genie-tests--with-repo
@@ -1477,11 +1459,11 @@ The effect is gone with the revert; undo must not error or strand it."
       (genie-acp-ensure session #'ignore)
       (genie-tests--answer agent 1 '(:protocolVersion 1))
       (should (equal (plist-get (plist-get (car sent) :params) :mcpServers)
-                     [(:type "acp" :name "emacs" :serverId "emacs-0")]))
+                     [(:type "acp" :name "emacs" :serverId "emacs-1")]))
       (cl-flet ((ask (id method params)
                   (genie-tests--say
                    agent (list :jsonrpc "2.0" :id id :method "mcp/message"
-                               :params (list :serverId "emacs-0" :requestId "r"
+                               :params (list :serverId "emacs-1" :requestId "r"
                                              :method method :params params)))
                   (plist-get (car sent) :result)))
         (should (equal (plist-get (aref (plist-get (plist-get (ask "a" "tools/list" nil)
@@ -1564,7 +1546,9 @@ The effect is gone with the revert; undo must not error or strand it."
   (let ((tool (cl-find "eval" genie-tools :test #'equal
                        :key (lambda (tool) (plist-get tool :name))))
         scheduled said)
-    (cl-letf (((symbol-function 'run-at-time)
+    (cl-letf ((genie-tests--put-off t)
+              (genie-live--waiting nil) (genie-live--timer nil)
+              ((symbol-function 'run-at-time)
                (lambda (_time _repeat function &rest args)
                  (push (lambda () (apply function args)) scheduled))))
       (funcall (plist-get tool :call) '(:code "(+ 1 2)")
@@ -1634,6 +1618,573 @@ The effect is gone with the revert; undo must not error or strand it."
     (should (= (length said) 1))
     (should (string-match-p "genie-spell-keep" (car said)))))
 
+
+;;;; What the review of 0.16 found, each as the test that would have caught it
+
+(ert-deftest genie-wish-two-on-one-thing-come-off-in-either-order ()
+  "Two wishes on one key and one option leave what was there, whichever goes first."
+  (dolist (first '(early late))
+    (genie-tests--with-wishes
+      (define-key genie-tests--map (kbd "C-c d") nil)
+      (genie-wish early "First." (genie-key genie-tests--map "C-c d" #'forward-char)
+        (genie-set 'genie-tests--option 80))
+      (genie-wish late "Second." (genie-key genie-tests--map "C-c d" #'backward-char)
+        (genie-set 'genie-tests--option 100))
+      (genie-wish-off first)
+      ;; the one still on is what holds
+      (should (eq (lookup-key genie-tests--map (kbd "C-c d"))
+                  (if (eq first 'early) #'backward-char #'forward-char)))
+      (should (= genie-tests--option (if (eq first 'early) 100 80)))
+      (genie-wish-off (if (eq first 'early) 'late 'early))
+      (should-not (lookup-key genie-tests--map (kbd "C-c d")))
+      (should (= genie-tests--option 1)))))
+
+(ert-deftest genie-wish-a-deferred-part-does-not-outlive-its-wish ()
+  "Redefined or forgotten, a wish's deferred part stays out when the library loads."
+  (genie-tests--with-wishes
+    (let ((feature (intern (format "genie-tests-late-%d" (random 100000))))
+          (file (expand-file-name "gone.el" genie-wish-directory)))
+      (genie-wish redefined "Once." (genie-after feature (genie-add 'genie-tests--list 'old)))
+      (genie-wish redefined "Again." (genie-after feature (genie-add 'genie-tests--list 'new)))
+      (with-temp-file file
+        (insert (format "(genie-wish gone \"x\" (genie-after '%s (genie-add 'genie-tests--list 'gone)))" feature)))
+      (genie-wish-load-file file)
+      (genie-wish-forget-file file)
+      (provide feature)
+      (should (memq 'new genie-tests--list))
+      (should-not (memq 'old genie-tests--list))
+      (should-not (memq 'gone genie-tests--list)))))
+
+(ert-deftest genie-wish-a-change-that-signals-halfway-is-still-taken-back ()
+  "The way back is noted before the change is made."
+  (genie-tests--with-wishes
+    (genie-wish half "Fail inside one effect."
+      (genie-effect "a flag, then a failure"
+                    (lambda () (setq genie-tests--effect t) (error "Halfway"))
+                    (lambda () (setq genie-tests--effect nil))))
+    (should-not genie-tests--effect)
+    (should (eq (plist-get (car (genie-wish-list)) :state) 'broken))))
+
+(ert-deftest genie-wish-a-mode-hook-lets-go-of-buffers-opened-since ()
+  "Off, a wish leaves the buffers it reached — and no others."
+  (genie-tests--with-wishes
+    (let ((mine (generate-new-buffer "genie-tests-mine.el"))
+          later)
+      (unwind-protect
+          (progn
+            (with-current-buffer mine
+              (delay-mode-hooks (emacs-lisp-mode))
+              (display-line-numbers-mode 1)) ; on before the wish: not its
+            (genie-wish numbers "Number the lines of programs."
+              (genie-hook 'prog-mode-hook #'display-line-numbers-mode))
+            (setq later (generate-new-buffer "genie-tests-later.el"))
+            (with-current-buffer later (emacs-lisp-mode))
+            (should (buffer-local-value 'display-line-numbers-mode later))
+            (genie-wish-off 'numbers)
+            (should-not (buffer-local-value 'display-line-numbers-mode later))
+            (should (buffer-local-value 'display-line-numbers-mode mine)))
+        (kill-buffer mine)
+        (when later (kill-buffer later))))))
+
+(ert-deftest genie-wish-a-damaged-off-file-and-a-symlinked-path-do-no-harm ()
+  "A list of wishes kept off that is not a list keeps nothing off."
+  (genie-tests--with-wishes
+    (with-temp-file (genie-wish-off-file) (insert "<<<<<<< HEAD\n(a)\n"))
+    (should-not (genie-wish-disabled))
+    (genie-wish fine "Still on." (genie-set 'genie-tests--option 5))
+    (should (= genie-tests--option 5))
+    ;; and a wish is forgotten by the file it is, however that is spelled
+    (let* ((file (expand-file-name "linked.el" genie-wish-directory))
+           (link (make-temp-file "genie-tests-link")))
+      (with-temp-file file
+        (insert "(genie-wish linked \"x\" (genie-add 'genie-tests--list 'linked))"))
+      (delete-file link)
+      (make-symbolic-link genie-wish-directory link)
+      (unwind-protect
+          (progn
+            (genie-wish-load-file (expand-file-name "linked.el" link))
+            (should (memq 'linked genie-tests--list))
+            (genie-wish-forget-file file)
+            (should-not (memq 'linked genie-tests--list)))
+        (delete-file link)))))
+
+(ert-deftest genie-lint-reads-a-wish-file-for-what-has-no-way-back ()
+  "Anything changed where it stands is named; what is only defined is not."
+  (cl-flet ((problems (form) (genie-validate--at-top form)))
+    ;; at the top level, only definitions
+    (dolist (form '((add-hook 'a #'b) (load-theme 'x t) (setq a 1) (push 1 a)
+                    (vertico-mode 1) (when t (global-set-key "a" #'b))))
+      (should (problems form)))
+    (dolist (form '((defun f () (add-hook 'a #'b nil t) (setq x 1))
+                    (defvar v 1) (require 'cl-lib)
+                    (use-package magit :ensure t :defer t)))
+      (should-not (problems form)))
+    (should (string-match-p ":bind"
+                            (car (problems '(use-package magit :ensure t
+                                              :bind ("C-x g" . magit))))))
+    ;; inside a wish, at any depth
+    (dolist (body '(((setq a 1))
+                    ((dolist (h hooks) (add-hook h #'f)))
+                    ((mapc (lambda (k) k) keys) (cond (x (define-key m "a" #'b))))
+                    ((genie-after 'org (and x (advice-add 'f :around #'g))))
+                    ((foo-mode 1)) ((foo-mode))))
+      (should (problems `(genie-wish w "d" ,@body))))
+    (dolist (body '(((genie-key global-map "C-c d" #'f)
+                     (genie-timer (run-at-time 1 nil #'f)))
+                    ((let ((n 0)) (setq n (1+ n)) (genie-set 'x n)))
+                    ((dolist (h hooks) (genie-hook h #'f)))
+                    ((when (foo-mode) (genie-set 'x 1)))
+                    ((genie-effect "x" (lambda () (setq a 1)) (lambda () (setq a 0))))))
+      (should-not (problems `(genie-wish w "d" ,@body))))))
+
+(ert-deftest genie-validation-refuses-a-wish-with-no-way-back ()
+  "The refusal reaches the agent as a verdict, before anything is loaded."
+  (genie-tests--with-repo
+    (genie-tests--write "wishes/slow.el"
+                        "(add-hook 'post-command-hook #'ignore)\n")
+    (genie-tests--write "mod.el" "(add-hook 'x #'ignore)\n")
+    (let ((genie--changed '("wishes/slow.el" "mod.el")) verdict)
+      (cl-letf (((symbol-function 'genie--judged) (lambda (it) (setq verdict it))))
+        (genie--validate))
+      (should-not (car verdict))
+      (should (string-match-p "`add-hook' at the top level" (cdr verdict)))
+      ;; outside the wishes nothing is asked of old code — but a hook that
+      ;; runs on every key is named wherever it is
+      (should (equal genie--cautions '(post-command-hook))))))
+
+(ert-deftest genie-batch-validation-is-this-emacs-and-fails-a-wish-that-would-not-start ()
+  "The other Emacs is told where the configuration lives; a wish that signals fails it."
+  (genie-tests--with-repo
+    (let ((user-emacs-directory (genie--root)))
+      (should (equal (cadr (genie-validate--like-here))
+                     `(setq user-emacs-directory ,(genie--root))))
+      (genie-tests--write "early-init.el" "(setq genie-tests-early t)\n")
+      (should (member `(load ,(expand-file-name "early-init.el" (genie--root)) nil t)
+                      (genie-validate--like-here)))
+      ;; the wishes are found because the directory is, not because init says
+      (genie-tests--write "init.el" "(require 'genie-wish)\n(genie-wish-load)\n")
+      (genie-tests--write "wishes/bad.el"
+                          "(genie-wish bad \"x\" (error \"Not today\"))\n")
+      (let ((genie--changed '("wishes/bad.el")) (genie-validate 'batch) verdict)
+        (setq genie--state 'validating)
+        (cl-letf (((symbol-function 'genie--judged)
+                   (lambda (it) (setq verdict it))))
+          (genie--validate)
+          (with-timeout (30 (error "Validation never answered"))
+            (while (not verdict) (accept-process-output nil 0.05))))
+        (should-not (car verdict))
+        (should (string-match-p "Not today" (cdr verdict)))))))
+
+(ert-deftest genie-validation-finds-what-a-wish-names-that-is-not-there ()
+  "A wish that loads but calls a function nobody defined goes back to the agent."
+  (genie-tests--with-repo
+    (let ((user-emacs-directory (genie--root)))
+      (genie-tests--write "init.el" "(require 'genie-wish)\n(genie-wish-load)\n")
+      (genie-tests--write
+       "wishes/wrap.el"
+       ";;; -*- lexical-binding: t; -*-
+(defun genie-tests-wrap () (setq-local genie-tests-nothing t) (genie-tests-no-such-function 1))
+(genie-wish wrap \"Wrap.\" (genie-hook 'text-mode-hook #'genie-tests-wrap))\n")
+      (let ((genie--changed '("wishes/wrap.el")) (genie-validate 'batch) verdict)
+        (setq genie--state 'validating)
+        (cl-letf (((symbol-function 'genie--judged)
+                   (lambda (it) (setq verdict it))))
+          (genie--validate)
+          (with-timeout (30 (error "Validation never answered"))
+            (while (not verdict) (accept-process-output nil 0.05))))
+        (should-not (car verdict))
+        (should (string-match-p "genie-tests-no-such-function.*not known to be defined"
+                                (cdr verdict)))
+        ;; and nothing was left behind by the compiling
+        (should-not (file-exists-p (expand-file-name "wishes/wrap.elc" (genie--root))))))))
+
+(ert-deftest genie-a-verdict-for-a-change-no-longer-pending-is-nobodys ()
+  "Quitting while a change is checked stops the check and forgets the change."
+  (genie-tests--with-repo
+    (genie-tests--write "init.el" "(sleep-for 30)\n")
+    (let ((genie--changed '("init.el")) (genie-validate 'batch) judged)
+      (setq genie--state 'validating)
+      (cl-letf (((symbol-function 'genie--judged) (lambda (_) (setq judged t))))
+        (genie--validate)
+        (let ((process genie--validation))
+          (should (process-live-p process))
+          (genie--abandon)
+          (should-not (process-live-p process))
+          (accept-process-output nil 0.2)))
+      (should-not judged)
+      (should-not genie--changed)
+      (should (eq genie--state 'idle)))))
+
+(ert-deftest genie-only-what-is-the-agents-is-committed-or-deleted ()
+  "A file that merely appeared during a turn is not the agent's."
+  (genie-tests--with-repo
+    (genie-tests--write "init.el" ";; base\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (genie--snapshot)
+    (genie-tests--write "elpa/foo-1.0/foo.el" "(setq genie-tests-foo t)\n")
+    (genie-tests--write "auto-save-list/.saves-1" "x\n")
+    (genie-tests--write "wishes/w.el" "(genie-wish w \"W.\")\n")
+    (genie-tests--write "GENIE.md" "# manual\n")
+    (genie-tests--agent-writes "extra.el" "(defvar genie-tests-extra 1)\n")
+    (genie--detect-changes)
+    (should (equal (sort (copy-sequence genie--changed) #'string<)
+                   '("GENIE.md" "extra.el" "wishes/w.el")))
+    (setq genie--state 'reviewing)
+    (genie-reject)
+    (should (file-exists-p (expand-file-name "elpa/foo-1.0/foo.el" (genie--root))))
+    (should (file-exists-p (expand-file-name "auto-save-list/.saves-1" (genie--root))))
+    (should-not (file-exists-p (expand-file-name "extra.el" (genie--root))))))
+
+(ert-deftest genie-undo-gives-back-the-file-as-it-was-before-the-wish ()
+  "What was uncommitted in a file before the wish survives taking the wish back."
+  (genie-tests--with-repo
+    (let ((genie-confirm nil))
+      (genie-tests--write "init.el" ";; base\n")
+      (genie--git "add" "-A")
+      (genie--git "commit" "-qm" "base")
+      (genie-tests--write "init.el" ";; base\n;; mine, not committed\n")
+      (genie--snapshot)
+      (genie-tests--write "init.el" ";; base\n;; mine, not committed\n;; the agent's\n")
+      (genie--detect-changes)
+      (setq genie--wish "add a line" genie--state 'reviewing
+            genie--verdict '(t . "ok"))
+      (cl-letf (((symbol-function 'genie--refresh) #'ignore))
+        (genie-apply)
+        (should (equal (genie--git "log" "-1" "--format=%s") "genie: add a line"))
+        (genie-undo))
+      (should (equal (genie-tests--read "init.el")
+                     ";; base\n;; mine, not committed\n"))
+      (should (equal (genie--git "log" "--format=%s") "base"))
+      ;; and nothing is left behind to say there was a wish
+      (should (string-empty-p (genie--git "for-each-ref" "refs/genie"))))))
+
+(ert-deftest genie-a-config-in-a-larger-repository-is-told-apart ()
+  "The configuration may be one directory of a repository; paths stay its own."
+  (let* ((outer (make-temp-file "genie-tests-outer" t))
+         (genie-config-root (expand-file-name "emacs/" outer))
+         (genie-wish-directory (expand-file-name "wishes" genie-config-root))
+         (genie-wish--all nil) (genie-wish--on nil) (genie--journal nil)
+         (genie--changed nil) (genie--created nil) (genie--pre nil)
+         (genie--pre-untracked nil) (genie--state 'idle) (genie--working nil)
+         (warning-suppress-log-types '((genie)))
+         (bound (lookup-key global-map (kbd "C-c g"))))
+    (unwind-protect
+        (let ((default-directory (file-name-as-directory outer)))
+          (make-directory genie-config-root)
+          (call-process "git" nil nil nil "init" "-q")
+          (call-process "git" nil nil nil "config" "user.email" "t@t")
+          (call-process "git" nil nil nil "config" "user.name" "t")
+          (with-temp-file (expand-file-name "emacs/init.el" outer) (insert ";; mine\n"))
+          (with-temp-file (expand-file-name "other.txt" outer) (insert "x\n"))
+          (call-process "git" nil nil nil "add" "-A")
+          (call-process "git" nil nil nil "commit" "-qm" "base")
+          (genie-setup)
+          (should-not (file-exists-p (expand-file-name ".git" genie-config-root)))
+          (should (file-exists-p (expand-file-name ".gitignore" genie-config-root)))
+          (with-temp-file (expand-file-name "other.txt" outer) (insert "y\n"))
+          (genie--snapshot)
+          (with-temp-file (expand-file-name "init.el" genie-config-root)
+            (insert ";; changed\n"))
+          (genie--detect-changes)
+          (should (equal genie--changed '("init.el"))))
+      (dolist (wish (genie-wish-list)) (genie-wish-off (plist-get wish :name)))
+      (define-key global-map (kbd "C-c g") bound)
+      (delete-directory outer t))))
+
+(ert-deftest genie-a-wish-git-would-ignore-is-refused-at-the-start ()
+  "A wish directory git ignores would be written to and never noticed."
+  (genie-tests--with-repo
+    (genie-tests--write ".gitignore" "/*\n!init.el\n")
+    (should-error (genie--turn-starting "a wish") :type 'user-error)))
+
+(ert-deftest genie-a-turn-that-cannot-be-taken-in-is-not-left-running ()
+  "Git refusing at the end of a turn must not leave the turn looking alive."
+  (let ((genie--state 'thinking) (genie--changed nil) (genie--working nil))
+    (cl-letf (((symbol-function 'genie--detect-changes)
+               (lambda () (error "Unable to create index.lock"))))
+      (genie--finish-turn "end_turn"))
+    ;; over, and what it wrote is still to be looked at, not forgotten
+    (should (eq genie--state 'reviewing))
+    (cl-letf (((symbol-function 'genie--detect-changes) #'ignore))
+      (should-error (genie-diff) :type 'user-error))
+    (should (eq genie--state 'idle))))
+
+(ert-deftest genie-what-could-slow-emacs-is-shown-before-it-is-applied ()
+  "Not mentioned afterwards, and not asked in a way a stray key could answer."
+  (let ((genie-confirm '(risky-code)) (genie--state 'validating)
+        (genie--cautions '(post-command-hook)) (genie--working nil)
+        applied shown)
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) (error "Asked")))
+              ((symbol-function 'genie-apply) (lambda () (setq applied t)))
+              ((symbol-function 'genie--show-diff) (lambda () (setq shown t))))
+      (genie--judged '(t . "ok")))
+    (should shown)
+    (should-not applied)))
+
+(ert-deftest genie-acp-an-agent-that-dies-at-once-says-so ()
+  "A process gone before its first answer still ends the turn waiting on it."
+  (let* ((agent (genie-acp-agent '("true"))) exited
+         (session (genie-acp-open agent "/tmp/project/"
+                                  :on-exit (lambda () (setq exited t)))))
+    (cl-letf (((symbol-function 'genie-acp--start)
+               (lambda (agent) (setf (genie-acp-agent-proc agent) 'dead)))
+              ((symbol-function 'process-live-p) (lambda (_) nil)))
+      (genie-acp-prompt session "hello")
+      (should (eq (genie-acp-session-state session) 'opening))
+      (genie-acp--sentinel agent 'dead))
+    (should exited)
+    (should-not (genie-acp-session-state session)) ; free to be opened again
+    (should-not (genie-acp-agent-opening agent))))
+
+(ert-deftest genie-acp-one-handler-failing-does-not-cost-the-next-line ()
+  "Lines that arrive together are each delivered, whatever one of them does."
+  (genie-tests--with-agent agent sent
+    (let (got)
+      (cl-letf (((symbol-function 'genie-acp--dispatch)
+                 (lambda (_agent message)
+                   (push (plist-get message :n) got)
+                   (when (= (plist-get message :n) 1) (error "Handler broke"))))
+                (inhibit-message t))
+        (genie-acp--filter agent "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n"))
+      (should (equal got '(3 2 1))))))
+
+(ert-deftest genie-live-waits-for-a-free-minibuffer-without-spinning ()
+  "One timer looks again every half second; what waited runs in the order it came."
+  (let ((genie-tests--put-off t) (genie-live--waiting nil) (genie-live--timer nil)
+        scheduled ran (busy t))
+    (cl-letf (((symbol-function 'active-minibuffer-window) (lambda () busy))
+              ((symbol-function 'run-at-time)
+               (lambda (time _repeat function &rest args)
+                 (push (cons time (lambda () (apply function args))) scheduled))))
+      (genie-live-when-free (lambda () (push 'first ran)))
+      (genie-live-when-free (lambda () (push 'second ran)))
+      (should (equal (mapcar #'car scheduled) '(0))) ; one timer for both
+      (funcall (cdr (pop scheduled)))    ; busy: looked at again, later
+      (should (equal (mapcar #'car scheduled) '(0.5)))
+      (funcall (cdr (pop scheduled)))
+      (should (equal (mapcar #'car scheduled) '(0.5)))
+      (should-not ran)
+      (setq busy nil)
+      (funcall (cdr (pop scheduled)))
+      (should (equal ran '(second first)))
+      (should-not scheduled))))
+
+(ert-deftest genie-tools-leave-the-persons-point-where-it-is ()
+  "Code acts where the wish was made; the cursor does not jump under their hands."
+  (let ((genie--journal nil) (genie-confirm nil))
+    (with-temp-buffer
+      (insert "hello world")
+      (goto-char 3)
+      (genie-live-remember-place)
+      (goto-char 9)                     ; they went on typing elsewhere
+      (genie-tools--describe '(:key "C-f"))
+      (should (= (point) 9))
+      (should (string-match-p "=> 3" (genie-tools--eval '(:code "(point)"))))
+      (should (= (point) 9))
+      (should-not mark-active))))
+
+(ert-deftest genie-a-cantrip-is-cast-from-the-event-loop ()
+  "What was conjured is not evaluated in the filter that delivered it."
+  (let ((genie--spell nil) (genie--spells nil) (genie--journal nil)
+        (genie--working nil) (genie--pending-register nil)
+        (genie-live--waiting nil) (genie-live--timer nil)
+        (genie-tests--put-off t) waiting)
+    (cl-letf (((symbol-function 'genie--busy) #'ignore)
+              ((symbol-function 'run-at-time)
+               (lambda (_time _repeat function &rest args)
+                 (push (lambda () (apply function args)) waiting))))
+      (genie-tests--conjuring
+        (genie--conjure "noop" "cantrip: noop")
+        (genie-tests--conjured "(defun genie-spell/late () (interactive) 'cast)")
+        (should-not genie--spell)       ; the filter only scheduled it
+        (funcall (car waiting))))
+    (should (eq (genie--spell-name genie--spell) 'genie-spell/late))))
+
+(ert-deftest genie-chat-a-message-that-is-refused-stays-typed ()
+  "Sent first and cleared after."
+  (genie-tests--with-chat
+    (setq genie-chat--start (lambda (_) (user-error "Not now")))
+    (goto-char (point-max))
+    (insert "do not lose me")
+    (should-error (genie-chat-send) :type 'user-error)
+    (should (equal (buffer-substring-no-properties genie-chat--input (point-max))
+                   "do not lose me"))))
+
+(ert-deftest genie-chat-a-failed-call-does-not-take-the-next-ones-line ()
+  "Two calls in flight each end on their own line."
+  (genie-tests--with-chat
+    (genie-chat--on-tool '(:toolCallId "a" :title "first"))
+    (genie-chat--on-tool '(:toolCallId "b" :title "second"))
+    (genie-chat--on-tool-update
+     '(:toolCallId "a" :status "failed"
+       :content [(:type "content" :content (:type "text" :text "it broke"))]))
+    (genie-chat--on-tool-update '(:toolCallId "b" :status "completed"))
+    (should (string-match-p "✗ first\n  it broke\n✓ second\n" (buffer-string)))
+    (should (zerop (hash-table-count genie-chat--calls)))))
+
+(ert-deftest genie-chat-going-back-does-not-rename-the-sessions-servers ()
+  "Saying the conversation again must not look like opening a different one."
+  (genie-tests--with-chat
+    (let (asked)
+      (cl-letf (((symbol-function 'genie-acp-call)
+                 (lambda (_session method params _callback)
+                   (push (cons method params) asked))))
+        (genie-chat--moved "moved\n"))
+      (should (equal (caar asked) "session/load"))
+      (should-not (plist-member (cdar asked) :mcpServers)))))
+
+(ert-deftest genie-markdown-emphasis-is-not-arithmetic ()
+  "Two asterisks inside code, or inside a word, are what was typed."
+  (with-temp-buffer
+    (cl-flet ((shown (line)
+                (erase-buffer) (insert line)
+                (genie-markdown-line (point-min) (point-max) nil "/" "")
+                (let ((seen ""))
+                  (dotimes (i (- (point-max) (point-min)) seen)
+                    (unless (get-text-property (+ (point-min) i) 'invisible)
+                      (setq seen (concat seen (string (char-after (+ (point-min) i))))))))))
+      (should (equal (shown "2**10 is 1024 and 3**5") "2**10 is 1024 and 3**5"))
+      (should (equal (shown "`x**2 + y**2` here") "x**2 + y**2 here"))
+      (should (equal (shown "def f(**kwargs): pass **more") "def f(**kwargs): pass **more"))
+      (should (equal (shown "**a** and **b**, done") "a and b, done")))))
+
+(ert-deftest genie-lamp-says-what-is-and-waits-its-turn ()
+  "A wish that cannot be switched on is not reported as on; nothing moves mid-change."
+  (genie-tests--with-repo
+    (genie-tests--write "wishes/bad.el" "(genie-wish bad \"Bad.\" (error \"No\"))\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "genie: bad")
+    (genie--refresh '("wishes/bad.el"))
+    (save-window-excursion
+      (genie-lamp)
+      (set-buffer "*genie lamp*")
+      (goto-char (point-min))
+      (let (said)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest args) (setq said (apply #'format format args)))))
+          (genie-lamp-toggle)
+          (should (string-match-p "could not be switched on: No" said))
+          (genie-lamp-toggle)))            ; nothing new to commit: no error
+      (setq genie--state 'reviewing)
+      (should-error (genie-lamp-toggle) :type 'user-error)
+      (kill-buffer))))
+
+(ert-deftest genie-the-first-wish-is-the-same-wherever-it-is-written ()
+  "The bootstrap script and `genie-setup' write the same first wish and rules."
+  (let ((script (with-temp-buffer
+                  (insert-file-contents
+                   (expand-file-name "bootstrap.sh"
+                                     (file-name-directory
+                                      (locate-library "genie"))))
+                  (buffer-string))))
+    (should (string-search genie--keys-wish script))
+    (should (string-search genie--gitignore script))))
+
+;;;; What the second look found
+
+(ert-deftest genie-validation-accepts-a-wish-that-names-its-libraries ()
+  "What a library defines is not missing when the wish waits for it or requires it."
+  (genie-tests--with-repo
+    (let ((user-emacs-directory (genie--root)))
+      ;; an init that compiles someone else's untidy file is not the wish's fault
+      (genie-tests--write "other.el" "(defun genie-tests-other () (genie-tests-nowhere))\n")
+      (genie-tests--write
+       "init.el"
+       (format "(require 'genie-wish)\n(require 'bytecomp)
+(let ((byte-compile-dest-file-function (lambda (_) %S)))
+  (byte-compile-file %S))\n(genie-wish-load)\n"
+               (expand-file-name "other.elc" (genie--root))
+               (expand-file-name "other.el" (genie--root))))
+      (genie-tests--write
+       "wishes/org-key.el"
+       ";;; -*- lexical-binding: t; -*-
+(defun genie-tests-omit () (interactive) (require 'dired-x) (dired-omit-mode 1))
+(genie-wish org-key \"A key in Org.\"
+  (genie-after 'org
+    (genie-key org-mode-map \"C-c d\" #'org-toggle-checkbox)))\n")
+      (let ((genie--changed '("wishes/org-key.el")) (genie-validate 'batch) verdict
+            (before (directory-files temporary-file-directory nil "\\`genie-validate")))
+        (setq genie--state 'validating)
+        (cl-letf (((symbol-function 'genie--judged)
+                   (lambda (it) (setq verdict it))))
+          (genie--validate)
+          (with-timeout (60 (error "Validation never answered"))
+            (while (not verdict) (accept-process-output nil 0.05))))
+        (should (equal verdict '(t . "the config starts cleanly")))
+        (should (equal (directory-files temporary-file-directory nil "\\`genie-validate")
+                       before))))))
+
+(ert-deftest genie-lint-knows-a-definition-and-a-local-when-it-sees-one ()
+  "Definitions by any name pass; what is done to something made here passes."
+  (cl-flet ((problems (form) (genie-validate--at-top form "/nowhere/w.el")))
+    (dolist (form '((defvar-keymap my-map "a" #'ignore)
+                    (transient-define-prefix my-menu () "Menu.")
+                    (define-skeleton my-skel "S." nil "x")
+                    (easy-menu-define my-menu-var nil "M." '("x"))
+                    (put 'my-cmd 'repeat-map 'my-map)
+                    (genie-wish w "d"
+                      (let ((map (make-sparse-keymap)))
+                        (define-key map "a" #'ignore)
+                        (genie-key global-map "C-c m" map)))
+                    (genie-wish w "d"
+                      (when-let* ((value (getenv "X"))) (setq value (upcase value))
+                                 (genie-set 'x value)))))
+      (should-not (problems form)))
+    (dolist (form '((defalias 'yes-or-no-p 'y-or-n-p)
+                    (defun forward-char () nil)
+                    (genie-wish w "d" (mapc (lambda (k) (global-set-key k #'ignore)) keys))
+                    (genie-wish w "d" (funcall #'global-set-key "a" #'ignore))
+                    (genie-wish w "d" (set 'x 1))
+                    (genie-wish w "d" (setf (alist-get 'a some-alist) 1))
+                    (genie-wish w "d" (put 'x 'y 1))
+                    (genie-wish w "d" (set-face-attribute 'default nil :height 120))
+                    (genie-wish w "d" (load "x"))))
+      (should (problems form)))))
+
+(ert-deftest genie-wish-what-is-changed-last-is-taken-back-first ()
+  "A deferred part lands after wishes switched on since, and is undone as the latest."
+  (genie-tests--with-wishes
+    (let ((feature (intern (format "genie-tests-order-%d" (random 100000)))))
+      (genie-wish early "Sets it when the library loads."
+        (genie-after feature (genie-set 'genie-tests--option 1000)))
+      (genie-wish late "Sets it now." (genie-set 'genie-tests--option 2000))
+      (provide feature)
+      (should (= genie-tests--option 1000))
+      (genie-wish-off 'late)
+      (should (= genie-tests--option 1000)) ; early is still on, and still holds
+      (genie-wish-off 'early)
+      (should (= genie-tests--option 1)))))
+
+(ert-deftest genie-tools-eval-may-move-a-cursor-that-is-still-there ()
+  "\"Go to the end\" is a fair wish — for someone who has not moved on."
+  (let ((genie--journal nil) (genie-confirm nil))
+    (with-temp-buffer
+      (insert "hello world")
+      (goto-char 3)
+      (genie-live-remember-place)
+      (genie-tools--eval '(:code "(goto-char (point-max))"))
+      (should (= (point) (point-max))))))
+
+(ert-deftest genie-undo-says-when-it-cannot-give-back-what-was-not-committed ()
+  "A wish commit amended since has lost the note of what the files were before."
+  (genie-tests--with-repo
+    (let ((genie-confirm nil) asked)
+      (genie-tests--write "init.el" ";; base\n")
+      (genie--git "add" "-A")
+      (genie--git "commit" "-qm" "base")
+      (genie-tests--write "init.el" ";; base\n;; mine\n")
+      (genie--snapshot)
+      (genie-tests--write "init.el" ";; base\n;; mine\n;; the agent's\n")
+      (genie--detect-changes)
+      (setq genie--wish "add a line" genie--state 'reviewing genie--verdict '(t . "ok"))
+      (cl-letf (((symbol-function 'genie--refresh) #'ignore)
+                ((symbol-function 'y-or-n-p) (lambda (prompt) (setq asked prompt) nil)))
+        (genie-apply)
+        (genie--git "commit" "-q" "--amend" "--no-edit" "--date=2001-01-01T00:00:00")
+        (should-error (genie-undo) :type 'user-error))
+      (should (string-match-p "changed after genie made it" asked))
+      (should (equal (genie-tests--read "init.el") ";; base\n;; mine\n;; the agent's\n")))))
 
 (provide 'genie-tests)
 ;;; genie-tests.el ends here

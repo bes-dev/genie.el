@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: convenience, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -138,8 +138,7 @@ the command where it was asked from."
                      (if genie--pending-register
                          (format " or register %c" genie--pending-register)
                        "")))))
-    (error (display-buffer (genie--buffer))
-           (message "🧞 spell failed: %s" (error-message-string err))))
+    (error (message "🧞 spell failed: %s" (error-message-string err))))
   (setq genie--pending-register nil genie--cantrip-target nil))
 
 (defun genie--spell-command ()
@@ -154,12 +153,23 @@ local model."
 only." emacs-version))
           genie-elmee-args))
 
+(defun genie--spell-require-ready ()
+  "Signal unless a spell may be conjured now: one at a time."
+  (when genie--spell-session
+    (user-error "Genie is conjuring a spell — a moment, or M-x genie-abort")))
+
+(defun genie--spell-log (label answer)
+  "Note the spell asked for as LABEL, and ANSWER, in the genie's chat.
+Only if that chat is open: a spell is not a reason to start its agent."
+  (when (get-buffer genie-buffer)
+    (genie--emit (format "%s\n%s\n" label (string-trim answer)))))
+
 (defun genie--conjure (prompt label &optional cast-now)
   "Ask the spell agent for the command PROMPT describes.
 LABEL names the request in the transcript.  The answer is learnt as a
 spell and, with CAST-NOW, invoked where it was asked from.  Each
 conjuring is a conversation of its own, closed when it answers."
-  (genie--require-ready)
+  (genie--spell-require-ready)
   (unless genie--spell-agent
     (setq genie--spell-agent (genie-acp-agent (genie--spell-command))))
   (let* ((answer "")
@@ -168,13 +178,18 @@ conjuring is a conversation of its own, closed when it answers."
             (when genie--spell-session
               (genie-acp-close genie--spell-session)
               (setq genie--spell-session nil)
-              (genie--set-state 'idle)
+              (genie--busy 'spell nil)
               (if failure
                   (progn
                     (setq genie--pending-register nil genie--cantrip-target nil)
                     (message "🧞 spell failed: %s" failure))
-                (genie--emit (format "%s\n%s\n" label (string-trim answer)))
-                (genie--learn-spell answer cast-now))))))
+                ;; This is the agent's process filter.  What was conjured is
+                ;; evaluated, and a cantrip cast, from the event loop, where
+                ;; it can be asked about and can be interrupted.
+                (genie-live-when-free
+                 (lambda ()
+                   (genie--spell-log label answer)
+                   (genie--learn-spell answer cast-now))))))))
     (setq genie--spell-session
           (genie-acp-open
            genie--spell-agent (genie--root)
@@ -186,8 +201,7 @@ conjuring is a conversation of its own, closed when it answers."
                       (funcall finish
                                (or (genie-acp-stderr genie--spell-agent 3)
                                    "the agent process exited")))))
-    (genie--install-indicator)
-    (genie--set-state 'thinking)
+    (genie--busy 'spell "conjuring")
     (condition-case err
         (genie-acp-prompt genie--spell-session prompt)
       (error (funcall finish (error-message-string err))))))
@@ -215,7 +229,7 @@ character) it also lands in that spell register, castable via
 `genie-cast-register'.  `genie-spell-keep' makes a spell permanent."
   (interactive
    (progn
-     (genie--require-ready)
+     (genie--spell-require-ready)
      (list (string-trim (read-string "🧞 Spell (command to conjure): "
                                      nil 'genie--spell-history))
            (genie--read-register "🧞 Register for it (0-9, RET to skip): " t))))
@@ -258,7 +272,7 @@ cantrip worth repeating can be re-cast (`genie-cast'), slotted into a
 register (`genie-spell-bind') or made permanent (`genie-spell-keep')."
   (interactive
    (progn
-     (genie--require-ready)
+     (genie--spell-require-ready)
      (list (string-trim (read-string "🧞 Cantrip (do right now): "
                                      nil 'genie--spell-history)))))
   (when (string-empty-p request) (user-error "Empty cantrip"))

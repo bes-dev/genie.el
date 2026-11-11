@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: text, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -101,19 +101,27 @@ Nil leaves such links as plain text.")
 (defun genie-markdown--inline (beg end directory)
   "Dress what stands within the line from BEG to END.
 Paths are looked up against DIRECTORY."
-  (genie-markdown--each
-   beg end "\\(\\*\\*\\)\\([^*\n]+\\)\\(\\*\\*\\)"
-   (lambda ()
-     (genie-markdown--hide (match-beginning 1) (match-end 1))
-     (genie-markdown--hide (match-beginning 3) (match-end 3))
-     (add-face-text-property (match-beginning 2) (match-end 2) 'bold)))
+  ;; Code first: what stands inside it is not markdown.
   (genie-markdown--each
    beg end "\\(`\\)\\([^`\n]+\\)\\(`\\)"
    (lambda ()
      (genie-markdown--hide (match-beginning 1) (match-end 1))
      (genie-markdown--hide (match-beginning 3) (match-end 3))
+     (put-text-property (match-beginning 2) (match-end 2) 'genie-markdown-code t)
      (add-face-text-property (match-beginning 2) (match-end 2)
                              'genie-markdown-code)))
+  ;; Emphasis opens after a space or at the start and closes before one or
+  ;; at the end: `2**10' and `**kwargs' are not emphasis.
+  (genie-markdown--each
+   beg end "\\(?:^\\|[ \t(\"'>]\\)\\(\\*\\*\\)\\([^ *\n][^*\n]*\\)\\(\\*\\*\\)\\(?:$\\|[^[:alnum:]_*]\\)"
+   (lambda ()
+     (unless (text-property-any (match-beginning 1) (match-end 3)
+                                'genie-markdown-code t)
+       (genie-markdown--hide (match-beginning 1) (match-end 1))
+       (genie-markdown--hide (match-beginning 3) (match-end 3))
+       (add-face-text-property (match-beginning 2) (match-end 2) 'bold))
+     ;; What closed this one may be what the next one opens after.
+     (goto-char (match-end 3))))
   (genie-markdown--each
    beg end "\\(\\[\\)\\([^]\n[]+\\)\\(\\](\\(https?://[^)\n ]+\\))\\)"
    (lambda ()

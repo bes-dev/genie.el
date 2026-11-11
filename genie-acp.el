@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.16.0
+;; Version: 0.17.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: processes, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -87,10 +87,12 @@
   ready
   ;; Thunks waiting for the handshake.
   waiting
-  ;; Open sessions, as (ID . SESSION).
-  sessions
-  ;; Tools sessions offered, as (SERVER-ID . TOOLS).
-  servers
+  ;; Open sessions, as (ID . SESSION), and the ones still being opened,
+  ;; which have no id to be found by yet.
+  sessions opening
+  ;; Tools sessions offered, as (SERVER-ID . TOOLS), and how many sessions
+  ;; have offered any, which is what keeps the ids apart.
+  servers (served 0)
   ;; Agents a session started, as (ID SESSION . TITLE): each speaks under an
   ;; id of its own, and what it says belongs to the session that started it.
   children
@@ -102,6 +104,8 @@
   agent directory id handlers
   ;; nil before it is opened, `opening' meanwhile, t after.
   state
+  ;; The id its tools are served under, when it has tools.
+  server
   ;; Thunks waiting for it to open.
   waiting
   ;; A conversation to reopen instead of starting one, and whether what was
@@ -172,7 +176,7 @@ at startup has a readable reason."
        :clientCapabilities (:elicitation (:form nil)
                             :session (:compaction nil :notices nil)
                             :subagents nil)
-       :clientInfo (:name "genie.el" :version "0.16.0"))
+       :clientInfo (:name "genie.el" :version "0.17.0"))
      (lambda (result err)
        (if err
            (genie-acp--fail-all agent (genie-acp--reason err "initialize refused"))
@@ -197,24 +201,40 @@ The sessions are kept: each remembers the conversation it held and
 reopens it — without replaying it — the next time it is used."
   (when (and (not (process-live-p proc))
              (eq proc (genie-acp-agent-proc agent)))
-    (let ((sessions (mapcar #'cdr (genie-acp-agent-sessions agent))))
+    (let ((sessions (genie-acp--held agent)))
       (setf (genie-acp-agent-ready agent) nil
             (genie-acp-agent-waiting agent) nil
+            (genie-acp-agent-pending agent) nil
             (genie-acp-agent-children agent) nil
             (genie-acp-agent-servers agent) nil
+            (genie-acp-agent-opening agent) nil
             (genie-acp-agent-sessions agent) nil)
       (dolist (session sessions)
-        (setf (genie-acp-session-resume session) (genie-acp-session-id session)
+        (setf (genie-acp-session-resume session)
+              (or (genie-acp-session-id session)
+                  (genie-acp-session-resume session))
               (genie-acp-session-replay session) nil
               (genie-acp-session-state session) nil
               (genie-acp-session-waiting session) nil)
         (genie-acp--fire session :on-exit)))))
 
+(defun genie-acp--held (agent)
+  "Return the sessions of AGENT, both open and still being opened.
+A process that dies before it answered its first request has only the
+second kind, and they are the ones left waiting if nobody tells them."
+  (delete-dups (append (mapcar #'cdr (genie-acp-agent-sessions agent))
+                       (copy-sequence (genie-acp-agent-opening agent)))))
+
 (defun genie-acp--fail-all (agent message)
   "Report MESSAGE to every session waiting on AGENT."
-  (setf (genie-acp-agent-waiting agent) nil)
-  (dolist (cell (genie-acp-agent-sessions agent))
-    (genie-acp--fire (cdr cell) :on-fail message nil)))
+  (let ((sessions (genie-acp--held agent)))
+    (setf (genie-acp-agent-waiting agent) nil
+          (genie-acp-agent-opening agent) nil)
+    (dolist (session sessions)
+      (unless (eq (genie-acp-session-state session) t)
+        (setf (genie-acp-session-state session) nil
+              (genie-acp-session-waiting session) nil))
+      (genie-acp--fire session :on-fail message nil))))
 
 ;;;; The wire
 
@@ -250,7 +270,10 @@ the work proportional to what was sent."
                                  (json-parse-string line :object-type 'plist
                                                     :null-object nil
                                                     :false-object nil))))
-            (genie-acp--dispatch agent message)))))))
+            ;; One line's handler signalling must not cost the lines that
+            ;; came with it.
+            (with-demoted-errors "genie-acp: %S"
+              (genie-acp--dispatch agent message))))))))
 
 (defun genie-acp--dispatch (agent message)
   "Act on one MESSAGE from AGENT.
@@ -419,6 +442,7 @@ names instead of starting one, playing back what was said in it."
     (push thunk (genie-acp-session-waiting session))
     (unless (genie-acp-session-state session)
       (setf (genie-acp-session-state session) 'opening)
+      (push session (genie-acp-agent-opening (genie-acp-session-agent session)))
       (genie-acp--when-ready
        (genie-acp-session-agent session)
        (lambda () (genie-acp--open session))))))
@@ -429,14 +453,14 @@ names instead of starting one, playing back what was said in it."
          (resume (genie-acp-session-resume session))
          (tools (plist-get (genie-acp-session-handlers session) :tools))
          (server (and tools
-                      (format "emacs-%d"
-                              (length (genie-acp-agent-servers agent)))))
+                      (format "emacs-%d" (cl-incf (genie-acp-agent-served agent)))))
          (params (list :cwd (genie-acp-session-directory session)
                        :mcpServers
                        (if server
                            `[(:type "acp" :name "emacs" :serverId ,server)]
                          []))))
     (when server
+      (setf (genie-acp-session-server session) server)
       (push (cons server tools) (genie-acp-agent-servers agent)))
     (when resume
       ;; What was said is played back before the request is answered, so
@@ -450,6 +474,8 @@ names instead of starting one, playing back what was said in it."
            (t "session/resume"))
      (if resume (append (list :sessionId resume) params) params)
      (lambda (result err)
+       (setf (genie-acp-agent-opening agent)
+             (delq session (genie-acp-agent-opening agent)))
        (if err
            (progn
              (setf (genie-acp-session-state session) nil
@@ -513,6 +539,11 @@ The turn's end arrives at `:on-done' with why it stopped; a refusal at
                           #'ignore))
     (setf (genie-acp-session-state session) nil
           (genie-acp-session-waiting session) nil
+          (genie-acp-agent-opening agent)
+          (delq session (genie-acp-agent-opening agent))
+          (genie-acp-agent-servers agent)
+          (assoc-delete-all (genie-acp-session-server session)
+                            (genie-acp-agent-servers agent))
           (genie-acp-agent-sessions agent)
           (rassq-delete-all session (genie-acp-agent-sessions agent)))))
 

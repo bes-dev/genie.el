@@ -1,7 +1,7 @@
 EMACS ?= emacs
 FILES  = genie-wish.el genie-acp.el genie-live.el genie-tools.el \
-         genie-markdown.el genie-chat.el \
-         genie-pipeline.el genie-spell.el genie-lamp.el genie.el
+         genie-markdown.el genie-chat.el genie-sessions.el \
+         genie-validate.el genie-pipeline.el genie-spell.el genie-lamp.el genie.el
 
 .PHONY: all compile checkdoc test lint clean
 
