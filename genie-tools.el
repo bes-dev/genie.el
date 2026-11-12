@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: lisp, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -183,6 +183,66 @@
                 (format "\n\n*Warnings*\n%s" warnings)
               ""))))
 
+(defun genie-tools--windows ()
+  "Return the windows of the frame on one line, the selected one starred."
+  (mapconcat (lambda (window)
+               (concat (buffer-name (window-buffer window))
+                       (and (eq window (selected-window)) "*")))
+             (window-list nil 'no-minibuffer (frame-first-window))
+             " | "))
+
+(defun genie-tools--look (_args)
+  "Say what is on the screen: each window with its text, and any question.
+This is how an agent sees what its code did, and what the person sees."
+  (let ((number 0))
+    (concat
+     (format "Frame of %d columns by %d lines.\n" (frame-width) (frame-height))
+     (when-let* ((asked (active-minibuffer-window)))
+       (format "The minibuffer is asking: %s\n"
+               (with-current-buffer (window-buffer asked)
+                 (buffer-substring-no-properties (point-min) (point-max)))))
+     (when-let* ((said (current-message)))
+       (format "The echo area says: %s\n" (substring-no-properties said)))
+     (mapconcat
+      (lambda (window)
+        (with-current-buffer (window-buffer window)
+          (format "\n[%d]%s %s — %s, %d columns by %d lines at column %d, \
+line %d; showing lines %d to %d of %d, point on line %d\n%s"
+                  (cl-incf number)
+                  (if (eq window (selected-window)) " (selected)" "")
+                  (buffer-name) major-mode
+                  (window-total-width window) (window-total-height window)
+                  (window-left-column window) (window-top-line window)
+                  (line-number-at-pos (window-start window))
+                  (line-number-at-pos (window-end window t))
+                  (line-number-at-pos (point-max))
+                  (line-number-at-pos (window-point window))
+                  (truncate-string-to-width
+                   (buffer-substring-no-properties (window-start window)
+                                                   (window-end window t))
+                   1500 nil nil "\n[cut]"))))
+      (window-list nil 'no-minibuffer (frame-first-window)) ""))))
+
+(defun genie-tools--answering (answers function)
+  "Call FUNCTION, typing ANSWERS at the questions it asks, in order.
+A question nothing answers is not left for the person, who did not ask
+for it and may not be there: it ends the call, saying what was asked."
+  (let ((asked (lambda ()
+                 (if answers
+                     (setq unread-command-events
+                           (append
+                            (listify-key-sequence
+                             (if (eq (current-local-map) y-or-n-p-map)
+                                 (substring (pop answers) 0 1)
+                               (concat (pop answers) "\r")))
+                            unread-command-events))
+                   (error "The code stopped to ask “%s” and was ended there.  \
+Pass `answers', what to type at each question in order, or call a function \
+that takes the value as an argument" (string-trim (minibuffer-prompt)))))))
+    (add-hook 'minibuffer-setup-hook asked)
+    (unwind-protect (funcall function)
+      (remove-hook 'minibuffer-setup-hook asked))))
+
 (defun genie-tools--eval (args)
   "Run the Lisp in ARGS where the last wish was made; return what it gave.
 If the person is still where they asked, the code may move their cursor
@@ -191,17 +251,25 @@ buffer since, their point and mark are left where they are now: the
 code acts where the wish was made, and nothing jumps under their hands."
   (let* ((code (plist-get args :code))
          (place genie-live--place)
+         (said nil)
          (run (lambda ()
                 (let ((value (cdr (genie-live-call
                                    "eval" (lambda () (genie-live-eval code))))))
-                  (format "=> %S\n(ran in buffer %s)" value (buffer-name))))))
+                  (setq said (format "=> %S\n(ran in buffer %s" value
+                                     (buffer-name)))))))
     (genie-live-screen code)
-    (if (buffer-live-p (plist-get place :buffer))
-        (with-current-buffer (plist-get place :buffer)
-          (if (= (point) (plist-get place :point))
-              (genie-live-at place run)
-            (save-mark-and-excursion (genie-live-at place run))))
-      (funcall run))))
+    (genie-tools--answering
+     (append (plist-get args :answers) nil)
+     (lambda ()
+       ;; Whatever the code shows, the person stays in the window they are in.
+       (save-selected-window
+         (if (buffer-live-p (plist-get place :buffer))
+             (with-current-buffer (plist-get place :buffer)
+               (if (= (point) (plist-get place :point))
+                   (genie-live-at place run)
+                 (save-mark-and-excursion (genie-live-at place run))))
+           (funcall run)))))
+    (format "%s; the windows are now: %s)" said (genie-tools--windows))))
 
 (defun genie-tools--tool (name description properties required function
                                &optional acting)
@@ -249,13 +317,25 @@ with the first line of its documentation."
 and what went wrong."
     nil nil #'genie-tools--messages)
    (genie-tools--tool
+    "look"
+    "What is on the screen right now: every window with the buffer it shows, \
+its place in the frame and the text visible in it, what the minibuffer is \
+asking and what the echo area says. Look after you have changed what is \
+shown, to see that it came out as meant."
+    nil nil #'genie-tools--look)
+   (genie-tools--tool
     "eval"
     "Evaluate Emacs Lisp in the running session and return the value of the \
 last form. It runs in the buffer the user asked from, at their point, with \
 their region active. Use it to do something now, or to check that a change \
 took effect — not to change the configuration, which is done in files."
-    '(:code (:type "string" :description "One or more Lisp forms."))
-    '("code") #'genie-tools--eval t))
+    '(:code (:type "string" :description "One or more Lisp forms.")
+      :answers (:type "array" :items (:type "string") :description "What to \
+type at each question the code asks in the minibuffer, in order. A question \
+left without an answer ends the call.")
+      :what (:type "string" :description "What this does, in a few plain \
+words the user reads while it runs, such as \"run make check\"."))
+    '("code" "what") #'genie-tools--eval t))
   "What an agent may ask of, and do in, this Emacs.")
 
 (provide 'genie-tools)

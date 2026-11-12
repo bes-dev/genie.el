@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -74,9 +74,11 @@
 (require 'genie-sessions)
 (require 'genie-pipeline)
 (require 'genie-spell)
+(require 'genie-habits)
 (require 'genie-lamp)
 
 (defvar genie--wish-history nil "Minibuffer history for wishes.")
+(defvar genie--task-history nil "Minibuffer history for tasks.")
 
 ;;;###autoload (autoload 'genie-command-map "genie" nil t 'keymap)
 (defvar genie-command-map
@@ -84,6 +86,8 @@
     (define-key map "g" #'genie)
     (define-key map "c" #'genie-chat)
     (define-key map "a" #'genie-ask)
+    (define-key map "t" #'genie-task)
+    (define-key map "r" #'genie-reflect)
     (define-key map "l" #'genie-lamp)
     (define-key map "d" #'genie-diff)
     (define-key map "u" #'genie-undo)
@@ -92,6 +96,8 @@
     (define-key map "x" #'genie-cast)
     (define-key map "!" #'genie-cantrip)
     (define-key map "m" #'genie-manual)
+    (define-key map "~" #'genie-runtime-mode)
+    (define-key map "w" #'genie-keep)
     (dotimes (digit 10)
       (define-key map (number-to-string digit) #'genie-cast-register))
     map)
@@ -111,6 +117,22 @@
 
 (add-hook 'kill-emacs-hook #'genie--cleanup)
 
+(defconst genie--in-the-open
+  "I am watching this Emacs, and will go on from where you stop. Read and \
+edit files with your own tools: each edit is shown to me as you make it. \
+What gives me something to see or to keep, do in Emacs through `eval` \
+rather than in a shell: a build, a test or a script with `compile` (it \
+returns at once — read its buffer once its process has ended, and never \
+wait in Lisp), a search with `rgrep` or `occur`, a directory with \
+`dired-other-window`, changes with `vc-diff`, and whatever else Emacs has \
+a command for — `apropos` finds it. A menu of keys that a command opens \
+(Magit's, any transient) is for my hands: call the command it leads to, with \
+its arguments. When you have arranged windows or shown something, `look` \
+at the screen and put right what did not come out as asked. Leave the \
+window I am in alone. End with one or two lines: what you found, and what \
+you did."
+  "What a task asks of the agent besides the task: to do it where it shows.")
+
 (defun genie--where ()
   "Say where the person is, for an agent that will act there."
   (format "[Asked from the buffer %s — %s%s, line %d%s.]"
@@ -120,6 +142,25 @@
             "")
           (line-number-at-pos)
           (if (use-region-p) ", with the attached region active" "")))
+
+;;;###autoload
+(defun genie-task (task)
+  "Hand TASK to the agent of this project, and go on working.
+No window opens: the mode line says what the agent is at, and what it
+says at the end is said in the echo area — whole when it is a few
+lines, else its first line and where the rest is.  An active region
+goes with the task, as with `genie-ask'."
+  (interactive
+   (list (string-trim (read-string "🧞 Task: " nil 'genie--task-history))))
+  (when (string-empty-p task) (user-error "Empty task"))
+  (genie-live-remember-place)
+  (let ((item (genie-chat-context))
+        (chat (genie-chat-open (genie-chat--here))))
+    (deactivate-mark)
+    (when item (genie-chat-attach chat (car item) (cdr item)))
+    (genie-chat-submit chat (concat task "\n\n" (genie--where)
+                                    "\n\n" genie--in-the-open)
+                       task)))
 
 ;;;###autoload
 (defun genie (wish)
@@ -141,6 +182,26 @@ wish.  `genie-undo' takes back whatever was done."
       (genie-chat-attach (genie--buffer) (car region) (cdr region))
       (deactivate-mark))
     (genie--submit (concat wish "\n\n" where) wish)))
+
+;;;###autoload
+(defun genie-keep (what)
+  "Have the genie write down, as wishes, what it did in the running Emacs.
+WHAT says which of it; empty means all of it.  This is how something
+granted in `genie-runtime-mode' comes to stay: the configuration is
+written this once, validated and committed like any wish."
+  (interactive
+   (progn
+     (genie--require-ready)
+     (list (string-trim
+            (read-string "🧞 Keep (RET for all that was done at runtime): ")))))
+  (let ((genie-runtime-mode nil))
+    (genie--submit
+     (concat "Make what you did in the running Emacs during this conversation \
+part of the configuration: write it as wish files, one wish to a file, each \
+with what I asked for as its docstring. Change nothing else."
+             (if (string-empty-p what) "" (concat "\n\nOnly this: " what)))
+     (if (string-empty-p what) "Keep what was done at runtime"
+       (concat "Keep: " what)))))
 
 ;;;###autoload
 (defun genie-manual ()

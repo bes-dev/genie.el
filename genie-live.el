@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: lisp, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -48,6 +48,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'genie-follow)
 
 (defcustom genie-confirm '(wish risky-code undo)
   "Which genie actions stop to ask you first.
@@ -227,13 +228,19 @@ or (cast BUFFER PRE POST NAME) for code that edited BUFFER, where PRE
 and POST are its `buffer-undo-list' before and after.")
 
 (defun genie-live-call (name function)
-  "Call FUNCTION, journaling as NAME what it does to the current buffer."
-  (let ((buf (current-buffer)) pre)
+  "Call FUNCTION, journaling as NAME what it does to the current buffer.
+What it wrote there is lit for a while, to be seen."
+  (let* ((buf (current-buffer)) pre from to
+         (span (lambda (beg end _)
+                 (setq from (min beg (or from beg)) to (max end (or to end))))))
     (undo-boundary)
     (setq pre buffer-undo-list)
+    (add-hook 'after-change-functions span nil t)
     (unwind-protect (funcall function)
       (when (buffer-live-p buf)
         (with-current-buffer buf
+          (remove-hook 'after-change-functions span t)
+          (when from (genie-follow-light from (min to (point-max))))
           (undo-boundary)
           (unless (or (eq buffer-undo-list t) (eq buffer-undo-list pre))
             (push (list 'cast buf pre buffer-undo-list name)

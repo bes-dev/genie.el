@@ -3,6 +3,71 @@
 All notable changes to this project are documented here. The project
 follows [Semantic Versioning](https://semver.org).
 
+## [0.18.0] — 2026-11-12
+
+- `genie-runtime-mode` (`C-c g ~`) grants wishes in the running Emacs only:
+  nothing is written to the configuration, and what a wish changed is gone
+  at the next start. Should the agent edit the configuration all the same,
+  its files are put back. `genie-keep` (`C-c g w`) has the genie write
+  down, as wishes, what it did at runtime — all of it, or what you name —
+  validated and committed like any wish.
+- The agent can see: the `look` tool tells it every window, the text
+  visible in it, what the minibuffer asks and what the echo area says,
+  and `eval` reports the windows it left. Code that stops to ask a
+  question in the minibuffer no longer hangs Emacs: the agent passes
+  `answers`, and a question without one ends the call with what was asked.
+
+Found by recording an empty lamp growing into a configuration.
+
+- A wish whose package could not be installed is refused and handed back to
+  the agent. `use-package` only warns about a failed install, so the wish
+  used to be committed and do nothing.
+- The agent is told that `genie-after` loads nothing: it used to wait for
+  the very package whose mode it meant to switch on, and the wish was
+  granted without effect.
+- A wish can be made in a configuration that was just copied or synced:
+  files with new dates and the same text made `git stash create` fail, and
+  genie said only "git stash failed".
+- A package installed for a wish works at once when it replaces a library
+  the session had already loaded. With the `compat` Emacs ships loaded and
+  the one from ELPA only on disk, vertico failed on its first use with
+  "function definition is void" until Emacs was restarted — and marginalia,
+  installed beside it, was compiled against the old one and stayed broken
+  on disk. The Emacs that validates a wish now settles each package as it
+  is installed (`genie-packages.el`).
+- `genie-reflect` (`C-c g r`) asks the genie what this Emacs should change,
+  given how you worked: the commands you called by name, the files you
+  opened again and again, what you compiled, what you kept asking for —
+  read from the histories Emacs already keeps, nothing recorded. It
+  finds three changes with the evidence for each and asks in the
+  minibuffer which to grant: one key, and no list in a window.
+- `genie-task` (`C-c g t`) hands the agent of the project a task from the
+  minibuffer and opens nothing: you go on working where you are. The
+  agent is asked to work in Emacs, where it shows: `compile` for a build,
+  `rgrep` for a search, Dired for a directory. What it shows never takes
+  the window you are in.
+- What the agent changes is seen as it changes it (`genie-follow.el`): the
+  file appears in another window at the place that changed, the new lines
+  lit for `genie-follow-seconds`. Code run in a buffer lights what it
+  wrote there, too.
+- `genie-trail-mode` shows the steps of the turn in the tab bar, the
+  finished ones ticked. The `eval` tool now has the agent say in a few
+  words what its code does, and that is what the trail, the mode line
+  and the transcript show instead of the Lisp.
+- The mode line says what an agent is at — `🧞 edit report.py`,
+  `🧞 $ make test` — for the genie and for every chat, not only that
+  something is thinking.
+- No window opens that was not asked for. An answer of a few lines is said
+  in the echo area; of a longer one, its first line and where the rest
+  is. A wish that could not be applied says so in one line unless a
+  review was asked for.
+- Line numbers switched on everywhere no longer number the chat.
+- `bootstrap.sh` gives the lamp MELPA, where most of what one wishes for
+  lives, and a `custom.el` of its own, so Emacs no longer writes into the
+  `init.el` git keeps.
+- Installing genie as a package no longer compiles its tests, whose
+  warnings opened a `*Compile-Log*` on the first start.
+
 ## [0.17.0] — 2026-11-11
 
 An independent review of 0.16 found twenty-six defects. This release fixes

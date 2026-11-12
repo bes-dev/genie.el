@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: lisp, tools
 ;; URL: https://github.com/bes-dev/genie.el
@@ -62,9 +62,10 @@ changed files balance; nil checks nothing."
   :group 'genie)
 
 (defcustom genie-validate-timeout 120
-  "Seconds before the batch validation subprocess is killed.
-A wish that adds packages makes the validation install them, which can
-be slow on the first run — raise this when that bites."
+  "Seconds the batch validation subprocess may say nothing before it is killed.
+A wish that adds packages makes the validation install them, which
+takes as long as it takes and reports as it goes; what is stopped is a
+start that hangs."
   :type 'integer :group 'genie)
 
 ;;;; Can it be taken back?
@@ -216,10 +217,42 @@ cannot be taken back — put it in the `genie-wish', through an effect"
         (error nil))
       (nreverse forms))))
 
+(defun genie-validate--waits-for-itself (form installed)
+  "Return what in FORM waits for a package in INSTALLED that only it would load.
+`genie-after' loads nothing.  A theme or a mode that a package this very
+file installs brings is what would load that package, so inside a
+`genie-after' for it the wish is granted and nothing ever happens."
+  (pcase form
+    (`(genie-after ',(and library (guard (memq library installed))) . ,body)
+     (let (found)
+       (cl-labels ((walk (inner)
+                     (pcase inner
+                       (`(load-theme . ,_) (push "the theme" found))
+                       (`(genie-enable ',(and mode (guard (string-prefix-p
+                                                           (symbol-name library)
+                                                           (symbol-name mode))))
+                                       . ,_)
+                        (push (format "`%s'" mode) found))
+                       ((pred proper-list-p) (mapc #'walk inner)))))
+         (walk body))
+       (mapcar (lambda (what)
+                 (format "`genie-after %s' waits for %s to be loaded, and %s is what would load it — switch it on outright, outside `genie-after'"
+                         library library what))
+               (nreverse found))))
+    ((pred proper-list-p)
+     (mapcan (lambda (inner) (genie-validate--waits-for-itself inner installed))
+             (cl-remove-if-not #'consp form)))))
+
 (defun genie-validate-reversible (file)
-  "Return why the wishes in FILE could not be taken back, a list of strings."
-  (mapcan (lambda (form) (genie-validate--at-top form (file-truename file)))
-          (cl-remove-if-not #'consp (genie-validate--forms file))))
+  "Return why the wishes in FILE could not be granted as written, as strings.
+That is what could not be taken back, and what would never take effect."
+  (let ((forms (cl-remove-if-not #'consp (genie-validate--forms file))))
+    (nconc
+     (mapcan (lambda (form) (genie-validate--at-top form (file-truename file)))
+             forms)
+     (genie-validate--waits-for-itself
+      forms (cl-loop for form in forms
+                     when (eq (car form) 'use-package) collect (cadr form))))))
 
 ;;;; What could make Emacs wait?
 
@@ -266,6 +299,9 @@ on the load path — and a configuration is entitled to all three."
   (let ((early (locate-user-emacs-file "early-init.el")))
     `(progn
        (setq user-emacs-directory ,user-emacs-directory)
+       ;; This is the Emacs that installs what a wish asks for.
+       (require 'genie-packages)
+       (genie-packages-settle-installs)
        ,@(when (file-readable-p early) `((load ,early nil t)))
        ;; Emacs activates packages at startup without calling them
        ;; initialized, so either is the sign that this session has them.
@@ -312,10 +348,14 @@ of the compiling is kept."
 
 (defun genie-validate--refusal (output)
   "Return why the change that printed OUTPUT in the other Emacs is refused.
-That is a wish switched off for signalling, or what a wish file calls
-that does not exist; nil when there is neither."
+That is a wish switched off for signalling, a package that could not be
+installed, or what a wish file calls that does not exist; nil when there
+is none of them."
   (let (said (start 0))
-    (when (string-match "^Warning (genie): \\(.*\\)" output)
+    ;; `use-package' turns a failed install into a warning and carries on,
+    ;; so the start looks clean and the wish does nothing.
+    (when (string-match "^\\(?:Warning (genie)\\|Error (use-package)\\): \\(.*\\)"
+                        output)
       (push (match-string 1 output) said))
     (while (string-match "^genie-undefined: \\(.*\\)" output start)
       (setq start (match-end 0))
@@ -365,18 +405,27 @@ Return the process doing the checking, or nil when it is already done."
                            (cond
                             (ok "the config starts cleanly")
                             ((process-get proc 'genie--timeout)
-                             (format "validation timed out after %ss — raise \
-`genie-validate-timeout'" genie-validate-timeout))
+                             (format "validation said nothing for %ss and was \
+stopped — see `genie-validate-timeout'" genie-validate-timeout))
                             (t (truncate-string-to-width
                                 (or refused
                                     (car (last (split-string out "\n" t)))
                                     "batch load failed")
                                 600)))))))))))
-       (run-at-time genie-validate-timeout nil
-                    (lambda ()
-                      (when (process-live-p proc)
+       ;; Silence is what is timed, not the run: packages being installed
+       ;; say so line by line, and one killed half unpacked stays broken.
+       (let ((said 0) (since (float-time)) timer)
+         (setq timer
+               (run-at-time
+                2 2 (lambda ()
+                      (cond
+                       ((not (process-live-p proc)) (cancel-timer timer))
+                       ((/= said (buffer-chars-modified-tick buf))
+                        (setq said (buffer-chars-modified-tick buf)
+                              since (float-time)))
+                       ((> (- (float-time) since) genie-validate-timeout)
                         (process-put proc 'genie--timeout t)
-                        (kill-process proc))))
+                        (kill-process proc)))))))
        proc))
     (_ (funcall callback '(t . "validation skipped")) nil)))
 

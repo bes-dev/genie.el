@@ -224,6 +224,23 @@ is what makes it quick on a local model.
 
 The lamp is one use of a general thing: a chat with the
 [elmee](https://github.com/bes-dev/elmee) agent about a directory.
+`M-x genie-task` (`C-c g t`) hands that agent a task from the minibuffer
+and opens nothing: the mode line says what it is at (`🧞 edit report.py`),
+and what it says at the end is said in the echo area — whole when it is a
+few lines, else its first line and where the rest is. No window opens
+that was not asked for.
+
+The agent works in your Emacs rather than behind it. It is asked to do
+what you would want to see or keep with Emacs's own commands — a build
+with `compile`, a search with `rgrep`, a directory in Dired — so what it
+leaves is a buffer you go on from, `next-error` and all. The window you
+are in stays yours. Each edit it makes to a file is brought to the screen
+in another window, at the place that changed, with the new lines lit;
+after `genie-follow-seconds` the light goes out and a window that was
+opened only to show it closes. (A wish is judged by what Emacs becomes:
+the files of the configuration are not put on the screen.) `M-x genie-trail-mode` puts the steps of
+the turn along the top of the frame, in the tab bar, the finished ones
+ticked: `🧞 ✓ run make check › ✓ edit changelog.py › ◦ run it again`.
 `M-x genie-ask` (`C-c g a`) opens the chat for the project you are in and
 hands the agent what you are looking at — the active region, or with `C-u`
 the whole file (in Dired, the directory). `*genie*` itself is such a chat,
@@ -335,6 +352,7 @@ Also: `genie-panic`, `genie-journal` (what undo would take back),
 |---|---|---|
 | `genie-config-root` | `user-emacs-directory` | The git repository genie may edit |
 | `genie-wish-directory` | `wishes/` under `user-emacs-directory` | Where wishes are kept |
+| `genie-runtime-mode` | off | Grant wishes in the running Emacs only, writing nothing; `genie-keep` (`C-c g w`) writes down what should stay |
 | `genie-confirm` | `'(wish risky-code undo)` | Which actions stop to ask; drop `wish` to judge changes in the editor instead of in a diff |
 | `genie-validate` | `'batch` | `'batch` / `'parens` / `nil` |
 | `genie-validate-timeout` | `120` | Seconds before validation is killed (package installs are slow) |
@@ -353,14 +371,18 @@ One file, one job; each usable without the ones below it.
 |---|---|
 | `genie-wish.el` | Wishes that can be taken back: the effects, switching, loading. Depends on nothing. |
 | `genie-acp.el` | An [ACP](https://agentclientprotocol.com) client: one warm process, any number of sessions, tools served back to the agent. |
+| `genie-follow.el` | What the agent changes, shown as it changes it: the file, the place, the new lines lit. |
 | `genie-live.el` | Running conjured code in the live session: screened, off the filter, in place, undoable. |
 | `genie-tools.el` | Emacs as tools for its agent. |
 | `genie-markdown.el` | Markdown dressed a line at a time, as it streams. |
 | `genie-chat.el` | The chat buffer, for any directory. |
 | `genie-sessions.el` | The list of conversations kept for a directory. |
 | `genie-validate.el` | Whether a change may be applied: can it be taken back, does the config start, does it name what exists. |
+| `genie-packages.el` | A package installed into a running Emacs: what it replaces is loaded again, so it works at once and its dependents compile against it. |
+| `genie-trail.el` | The steps of the agent's turn, along the top of the frame. |
 | `genie-pipeline.el` | A change to the configuration, start to finish: the turn, the review, the commit, making it live, undo. |
 | `genie-spell.el` | Cantrips, spells and registers. |
+| `genie-habits.el` | What recurs in how you worked, read from the histories Emacs already keeps, and `genie-reflect`, which asks the genie what to change because of it. |
 | `genie-lamp.el` | The list of wishes. |
 | `genie.el` | The way in: `genie`, the keys, setup. |
 

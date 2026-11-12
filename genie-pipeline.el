@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -52,7 +52,9 @@
 (require 'genie-wish)
 (require 'genie-live)
 (require 'genie-validate)
+(require 'genie-packages)
 (require 'genie-chat)
+(require 'genie-trail)
 
 (defcustom genie-config-root user-emacs-directory
   "Root of the configuration the genie may edit.
@@ -133,6 +135,7 @@ the mode line does not jitter."
 (defun genie--busy (who doing)
   "Say that WHO is DOING something, or with DOING nil that it is done.
 The mode line shows it in every buffer for exactly as long."
+  (genie-trail-step (and doing (not genie--working)) doing)
   (setf (alist-get who genie--working nil 'remove) doing)
   (cond
    ((and genie--working (not genie--spinner-timer))
@@ -146,6 +149,20 @@ The mode line shows it in every buffer for exactly as long."
     (cancel-timer genie--spinner-timer)
     (setq genie--spinner-timer nil)))
   (force-mode-line-update t))
+
+(defvar genie--answered nil
+  "A function to call once with the genie's next answer, in place of saying it.")
+
+(defun genie--doing (chat what)
+  "Show in the mode line WHAT the agent of CHAT is doing; nil when it is done.
+The genie's own turn is over when the turn machine says so, which is
+after validation, not when its agent stops talking."
+  (let ((own (eq chat (get-buffer genie-buffer))))
+    (unless (and own (not what))
+      (genie--busy (if own 'turn chat)
+                   (and what (truncate-string-to-width what 44 nil nil "…"))))))
+
+(setq genie-chat-activity-function #'genie--doing)
 
 ;;;; The state machine
 
@@ -247,6 +264,9 @@ not, and is left alone."
 
 (defun genie--snapshot ()
   "Capture the pre-wish worktree as the restore point everything measures from."
+  ;; A file that was copied or touched looks changed to an index that has not
+  ;; looked again, and `git stash create' then fails with nothing to say.
+  (genie--git-p "update-index" "-q" "--refresh")
   (let ((stash (genie--git "stash" "create" "genie pre-wish")))
     (setq genie--pre (if (string-empty-p stash) "HEAD" stash)
           genie--pre-untracked (genie--untracked)
@@ -331,7 +351,10 @@ The effects are `genie-set', `genie-key', `genie-hook', `genie-advice', \
 `genie-enable', `genie-disable', `genie-add' (for `add-to-list'), \
 `genie-timer' (wrapping `run-at-time' or `run-with-idle-timer') and \
 `(genie-effect WHAT DO UNDO)' for anything else. `genie-after' defers \
-effects until a library is loaded. The top level of a wish file holds definitions and \
+effects until a library is loaded by something else: it loads nothing itself, \
+so a mode or a theme that a package brings is switched on outright (calling it \
+loads the package), never inside a `genie-after' for that same package, where \
+it would wait for ever. The top level of a wish file holds definitions and \
 nothing else, and never one over a function that already exists. Inside \
 the wish, never `setq', `global-set-key', `define-key', `add-hook', \
 `advice-add' or a bare mode call: they cannot be taken back, and the \
@@ -389,10 +412,14 @@ validates your edits, commits them and switches them on itself."
   "Return the chat about this configuration, creating it when needed.
 It is an ordinary `genie-chat' whose turns are bracketed by the
 pipeline: a snapshot before, change detection and validation after."
-  (genie-chat-open (genie--root) :name genie-buffer
-                   :command (genie--command)
-                   :start #'genie--turn-starting
-                   :finish #'genie--turn-ended))
+  (let ((chat (genie-chat-open (genie--root) :name genie-buffer
+                               :command (genie--command)
+                               :start #'genie--turn-starting
+                               :finish #'genie--turn-ended)))
+    ;; A wish is judged by what Emacs becomes, not by reading its Lisp:
+    ;; the files of the configuration are not put on the screen.
+    (with-current-buffer chat (setq-local genie-follow-seconds nil))
+    chat))
 
 (defun genie--abandon ()
   "Stop checking and forget the pending change; what it wrote stays written."
@@ -439,6 +466,26 @@ not be committed — take it out of .gitignore"
     (setq genie--wish (if genie--wish (concat genie--wish "; " label) label)))
   (genie--set-state 'thinking))
 
+(define-minor-mode genie-runtime-mode
+  "Grant wishes in the running Emacs only, leaving the configuration alone.
+Nothing is written: what a wish changes is gone at the next start.
+`genie-keep' has the genie write down, as wishes, what is worth
+keeping.  Should the agent edit the configuration all the same, its
+files are put back as they were."
+  :global t :group 'genie :lighter " 🧞~")
+
+(defconst genie--runtime-note
+  "[Runtime only. The configuration is not to be edited this turn: write no \
+file under the config root. Grant this in the running Emacs through `eval` — \
+set the variables, bind the keys, define the functions, switch on the modes, \
+and install a package it needs with `package-install`. It lasts until Emacs \
+is restarted; say so in a few words. Remember what you did: I may ask you \
+to keep it.]"
+  "What a wish says to the agent besides the wish in `genie-runtime-mode'.")
+
+(defvar genie--runtime nil
+  "Non-nil when the turn in flight may not change the configuration.")
+
 (defun genie--submit (wish &optional label)
   "Send WISH to the config's agent.
 The transcript and the commit message use LABEL instead when given; the
@@ -447,7 +494,12 @@ stays out of the commit message and shows as a note."
   (genie--require-ready)
   (let ((silent (eq label 'silent)))
     (when silent (genie--emit "↻ fixing what was not accepted\n"))
-    (genie-chat-submit (genie--buffer) wish (if silent 'note label))
+    (setq genie--runtime genie-runtime-mode)
+    (genie-chat-submit (genie--buffer)
+                       (if genie--runtime
+                           (concat wish "\n\n" genie--runtime-note)
+                         wish)
+                       (if silent 'note (or label wish)))
     (message "🧞 genie is working… (M-x genie-abort interrupts)")))
 
 (defun genie--turn-ended (stop)
@@ -471,9 +523,18 @@ in flight, so late or duplicate agent events cannot re-run the pipeline."
             (setq genie--verdict nil genie--repairs 0)
             (genie--set-state 'idle)
             ;; Nothing changed, so the wish was granted as an answer or an
-            ;; act, and the agent's words are the whole result: show them.
-            (display-buffer (genie--buffer))
-            (message "🧞 done"))
+            ;; act, and the agent's words are the whole result.
+            (if genie--answered
+                (funcall (prog1 genie--answered (setq genie--answered nil))
+                         (buffer-local-value 'genie-chat--reply (genie--buffer)))
+              (genie-chat-say (genie--buffer))))
+           (genie--runtime
+            ;; Asked to leave the configuration alone, and it did not.
+            (genie--restore-worktree)
+            (genie--reset)
+            (genie--set-state 'idle)
+            (message "🧞 runtime only — the configuration was put back as it \
+was; M-x genie-keep writes down what should stay"))
            ((not (member stop '(nil "end_turn")))
             ;; Stopped, refused or dead in the middle of an edit.  Half a
             ;; change is nobody's wish: it is neither committed nor thrown
@@ -571,7 +632,9 @@ change.  Reply with a one-line note of what was wrong." (cdr verdict))
     (genie--restore-worktree)
     (genie--reset)
     (genie--set-state 'idle)
-    (display-buffer (genie--buffer))
+    ;; As when a wish is applied: someone who asked for no review is
+    ;; looking at the editor, and one line there says what happened.
+    (when (genie--confirm-p 'wish) (display-buffer (genie--buffer)))
     (message "🧞 couldn't do it — \"%s\" could not be applied (%s), so \
 nothing was changed"
              (truncate-string-to-width wish 40 nil nil "…")
@@ -656,7 +719,10 @@ definitions — and one that fails to load offers a restart."
     ;; and this session has to be told before a wish asks for it.
     (when (and wishes (or (bound-and-true-p package--initialized)
                           (bound-and-true-p package--activated)))
-      (package-initialize))
+      (let ((had package-activated-list))
+        (package-initialize)
+        (unless (eq had package-activated-list)
+          (genie-packages-reload-shadowed))))
     (dolist (file wishes)
       (let ((path (expand-file-name file root)))
         (if (file-exists-p path)

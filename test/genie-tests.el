@@ -369,6 +369,37 @@ docs at https://example.com/docs." file))
       (should (equal (genie-chat--call-title '(:title "web_search emacs"))
                      "web_search emacs")))))
 
+(ert-deftest genie-chat-what-the-agent-is-at-is-told-to-whoever-shows-it ()
+  "A turn says it thinks, each tool call says what it does, the end says nil."
+  (genie-tests--with-chat
+    (let* (told
+           (genie-chat-activity-function
+            (lambda (buffer what) (push (cons (eq buffer chat) what) told))))
+      (setq genie-chat--busy (current-time))
+      (genie-chat--on-tool '(:toolCallId "1" :title "exec make test" :kind "execute"
+                             :rawInput (:command "make test")))
+      (genie-chat--finish-turn "end_turn")
+      (should (equal told '((t) (t . "$ make test")))))))
+
+(ert-deftest genie-chat-an-answer-is-said-and-no-window-is-opened-for-it ()
+  "A short answer is said whole; of a long one, its first line and where it is."
+  (genie-tests--with-chat
+    (let (said shown)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format &rest args) (setq said (apply #'format format args))))
+                ((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _) (setq shown buffer))))
+        (setq genie-chat--busy (current-time))
+        (genie-chat--on-text "It is `/search`: p95 is 3403 ms.")
+        (genie-chat--finish-turn "end_turn")
+        (should (equal said "🧞 It is `/search`: p95 is 3403 ms."))
+        (setq genie-chat--busy (current-time) genie-chat--pen nil)
+        (genie-chat--on-text "one\ntwo\nthree\nfour\nfive")
+        (genie-chat--finish-turn "end_turn")
+        (should (string-prefix-p "🧞 one\n" said))
+        (should (string-search (buffer-name chat) said))
+        (should-not shown)))))
+
 (ert-deftest genie-chat-a-turn-carries-what-was-attached ()
   "What `genie-ask' attached goes with the next message, once."
   (genie-tests--with-chat
@@ -900,6 +931,40 @@ BODY sees `applied', `shown', `repaired' and `gave-up'."
     ;; nothing was committed, and the index is clean for the next wish
     (should (equal (genie--git "log" "--format=%s") "base"))
     (should (equal (genie--git "status" "--porcelain") ""))))
+
+(ert-deftest genie-runtime-mode-leaves-the-configuration-alone ()
+  "In runtime mode the agent is told so, what it wrote anyway is put back, and keeping writes."
+  (genie-tests--with-repo
+    (genie-tests--write "a.el" "(setq a 1)\n")
+    (genie--git "add" "-A")
+    (genie--git "commit" "-qm" "base")
+    (let ((genie--state 'idle) (genie--changed nil) (genie--wish nil)
+          (genie-runtime-mode t) sent)
+      (cl-letf (((symbol-function 'genie-acp-prompt)
+                 (lambda (_session blocks)
+                   (setq sent (plist-get (car (last blocks)) :text))))
+                ((symbol-function 'genie--install-indicator) #'ignore))
+        (unwind-protect
+            (progn
+              (genie--submit "wrap long lines")
+              (should (string-match-p "\\`wrap long lines\n\n\\[Runtime only" sent))
+              (should (equal genie--wish "wrap long lines"))
+              ;; the agent edits the configuration all the same
+              (genie-tests--write "a.el" "(setq a 2)\n")
+              (genie-tests--agent-writes "new.el" "(setq new 1)\n")
+              (with-current-buffer (genie--buffer) (setq genie-chat--busy nil))
+              (genie--finish-turn "end_turn")
+              (should (equal (genie-tests--read "a.el") "(setq a 1)\n"))
+              (should-not (file-exists-p (expand-file-name "new.el" (genie--root))))
+              (should (eq genie--state 'idle))
+              (should (equal (genie--git "log" "--format=%s") "base"))
+              ;; asked to keep it, the genie may write this once
+              (genie-keep "the wrapping")
+              (should-not genie--runtime)
+              (should-not (string-match-p "Runtime only" sent))
+              (should (string-match-p "Only this: the wrapping" sent)))
+          (kill-buffer (genie--buffer))
+          (genie--set-state 'idle))))))
 
 (ert-deftest genie-repair-turn-stays-out-of-the-commit-message ()
   "A repair turn does not append itself to the wish used as commit message."
@@ -1736,6 +1801,226 @@ The effect is gone with the revert; undo must not error or strand it."
                     ((when (foo-mode) (genie-set 'x 1)))
                     ((genie-effect "x" (lambda () (setq a 1)) (lambda () (setq a 0))))))
       (should-not (problems `(genie-wish w "d" ,@body))))))
+
+(ert-deftest genie-habits-say-what-recurs-with-the-evidence ()
+  "What was done once is not a habit; what recurs is counted, with its key."
+  (require 'genie-habits)
+  (let ((extended-command-history '("sort-lines" "compile" "sort-lines" "sort-lines"))
+        (file-name-history '("~/a.org" "~/a.org" "~/b.org" "~/a.org"))
+        (compile-history nil) (shell-command-history nil)
+        (genie--wish-history nil) (genie--spell-history nil))
+    (let ((said (genie-habits)))
+      (should (string-search "3× M-x sort-lines (no key)" said))
+      (should-not (string-search "compile" said))
+      (should (string-search "3× ~/a.org" said))
+      (should-not (string-search "b.org" said)))
+    (let ((extended-command-history nil) (file-name-history nil))
+      (should-not (genie-habits)))))
+
+(ert-deftest genie-habits-the-change-chosen-becomes-a-wish ()
+  "What the genie proposed is offered by number; the one chosen is wished for."
+  (require 'genie-habits)
+  (let (asked wished)
+    (cl-letf (((symbol-function 'read-char-choice)
+               (lambda (prompt keys &rest _)
+                 (setq asked (cons prompt keys))
+                 ?2))
+              ((symbol-function 'genie) (lambda (wish) (setq wished wish))))
+      (genie-habits--choose "- Clean whitespace on save — 4 times\n\
+- F2 opens todo.org — you opened it 5 times\nand a remark")
+      (should (string-match-p "1  Clean whitespace on save — 4 times\n  2  F2 opens"
+                              (car asked)))
+      (should (equal (cdr asked) '(?\r ?1 ?2)))
+      (should (equal wished "F2 opens todo.org")))))
+
+(ert-deftest genie-validate-refuses-what-waits-for-the-package-it-would-load ()
+  "A theme or a mode deferred until its own freshly installed package loads never comes."
+  (let ((file (make-temp-file "genie-wish" nil ".el" "\
+(use-package doom-themes :ensure t :defer t)
+(use-package doom-modeline :ensure t :defer t)
+(use-package markdown-mode :ensure t :defer t)
+(genie-wish dark
+  \"Dark.\"
+  (genie-after 'doom-themes
+    (genie-effect \"theme\" (lambda () (load-theme 'doom-molokai t)) #'ignore))
+  (genie-after 'doom-modeline (genie-enable 'doom-modeline-mode))
+  (genie-after 'markdown-mode
+    (genie-key markdown-mode-map \"<f6>\" #'ignore))
+  (genie-after 'org (genie-enable 'org-indent-mode)))")))
+    (unwind-protect
+        (let ((why (genie-validate-reversible file)))
+          (should (= (length why) 2))
+          (should (string-match-p "doom-themes.*the theme" (car why)))
+          (should (string-match-p "doom-modeline-mode" (cadr why))))
+      (delete-file file))))
+
+(ert-deftest genie-packages-a-half-unpacked-package-is-installed-again ()
+  "A package whose install was interrupted is reinstalled; a whole one is left alone."
+  (require 'genie-packages)
+  (let* ((package-user-dir (make-temp-file "genie-elpa" t))
+         (whole (expand-file-name "whole-1.0" package-user-dir))
+         (broken (expand-file-name "broken-1.0" package-user-dir))
+         (package-alist
+          (list (list 'whole (package-desc-create :name 'whole :version '(1 0)
+                                                  :dir whole))
+                (list 'broken (package-desc-create :name 'broken :version '(1 0)
+                                                   :dir broken))))
+         again)
+    (unwind-protect
+        (cl-letf (((symbol-function 'package-reinstall)
+                   (lambda (name) (push name again))))
+          (make-directory whole) (make-directory broken)
+          (write-region "" nil (expand-file-name "whole-autoloads.el" whole))
+          (write-region "" nil (expand-file-name "broken.el" broken))
+          (genie-packages-mend-broken)
+          (should (equal again '(broken))))
+      (delete-directory package-user-dir t))))
+
+(ert-deftest genie-tools-look-says-what-each-window-shows ()
+  "The agent is told which windows there are, what they show and which is selected."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (rename-buffer "genie-look-a" t)
+      (insert "alpha text")
+      (switch-to-buffer (current-buffer))
+      (let ((other (split-window)))
+        (with-temp-buffer
+          (rename-buffer "genie-look-b" t)
+          (insert "beta text")
+          (set-window-buffer other (current-buffer))
+          (let ((seen (genie-tools--look nil)))
+            (should (string-match-p "\\[1\\] (selected) genie-look-a" seen))
+            (should (string-match-p "alpha text" seen))
+            (should (string-match-p "\\[2\\] genie-look-b" seen))
+            (should (string-match-p "beta text" seen))))))))
+
+(ert-deftest genie-tools-a-question-nobody-answers-ends-the-code ()
+  "A question the code asks is typed the answer passed for it, and ends the code without one."
+  (let ((ask (lambda () (run-hooks 'minibuffer-setup-hook)))
+        unread-command-events)
+    (cl-letf (((symbol-function 'minibuffer-prompt) (lambda () "Project: ")))
+      (genie-tools--answering '("lamp") ask)
+      (should (equal unread-command-events (listify-key-sequence "lamp\r")))
+      (should (string-match-p
+               "stopped to ask “Project:”"
+               (cadr (should-error (genie-tools--answering nil ask)))))
+      (should-not (memq 'genie-tools--answering minibuffer-setup-hook)))))
+
+(ert-deftest genie-follow-closing-its-window-leaves-one-where-one-is ()
+  "The window opened to show a change closes without selecting another."
+  (require 'genie-follow)
+  (let ((file (make-temp-file "genie-follow" nil ".txt" "one\ntwo\n"))
+        (genie-follow-seconds 60))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (genie-follow--show (list :type "diff" :path file
+                                    :oldText "one\n2" :newText "one\ntwo"))
+          (let* ((buffer (find-buffer-visiting file))
+                 (shown (get-buffer-window buffer))
+                 (elsewhere (split-window (selected-window) nil t)))
+            (select-window elsewhere)
+            (with-current-buffer buffer
+              (genie-follow--dim (car (overlays-in (point-min) (point-max)))
+                                 shown))
+            (should-not (window-live-p shown))
+            (should (eq (selected-window) elsewhere))
+            (kill-buffer buffer)))
+      (delete-file file))))
+
+(ert-deftest genie-trail-keeps-the-steps-of-a-turn-in-order ()
+  "Finished steps are ticked, thinking gives way to what is done, a turn starts afresh."
+  (require 'genie-trail)
+  (let (genie-trail--steps (genie-trail--over t))
+    (cl-flet ((shown () (nth 2 (car (genie-trail)))))
+      (genie-trail-step t "thinking")
+      (genie-trail-step nil "run make check")
+      (genie-trail-step nil "edit changelog.py")
+      (should (string-match-p "✓ run make check  ›  ◦ edit changelog.py\\'" (shown)))
+      (genie-trail-step nil nil)
+      (should (string-match-p "✓ edit changelog.py\\'" (shown)))
+      (genie-trail-step t "thinking")
+      (should-not (string-match-p "make check" (shown))))))
+
+(ert-deftest genie-follow-lights-only-the-lines-a-hunk-changed ()
+  "The context a hunk carries around its change is not lit; a new file is, whole."
+  (require 'genie-follow)
+  (should (equal (genie-follow--changed "a\nb\nc" "a\nB\nB2\nc") '(1 . 2)))
+  (should (equal (genie-follow--changed nil "x\ny") '(0 . 2)))
+  (should (equal (genie-follow--changed "a\nb\nc" "a\nc") '(1 . 0))))
+
+(ert-deftest genie-follow-shows-an-edit-without-taking-the-window-one-is-in ()
+  "The edited file appears in another window, at the change, with it lit."
+  (require 'genie-follow)
+  (let ((file (make-temp-file "genie-follow" nil ".txt" "one\ntwo\nthree\n"))
+        (genie-follow-seconds 60))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((mine (selected-window)))
+            (genie-follow--show (list :type "diff" :path file
+                                      :oldText "one\n2\nthree"
+                                      :newText "one\ntwo\nthree"))
+            (let ((buffer (find-buffer-visiting file)))
+              (should (eq (selected-window) mine))
+              (should (get-buffer-window buffer))
+              (with-current-buffer buffer
+                (let ((lit (car (overlays-in (point-min) (point-max)))))
+                  (should (equal (buffer-substring (overlay-start lit)
+                                                   (overlay-end lit))
+                                 "two\n"))))
+              (kill-buffer buffer))))
+      (delete-file file))))
+
+(ert-deftest genie-chat-line-numbers-everywhere-stay-out-of-a-chat ()
+  "Switching line numbers on globally does not number a conversation."
+  (with-temp-buffer
+    (genie-chat-mode)
+    (unwind-protect
+        (progn (global-display-line-numbers-mode 1)
+               (should-not display-line-numbers))
+      (global-display-line-numbers-mode -1))))
+
+(ert-deftest genie-a-library-a-new-package-replaces-is-loaded-again ()
+  "What was loaded from elsewhere is loaded from the package that now has it."
+  (let* ((old (make-temp-file "genie-tests-old" t))
+         (package-user-dir (make-temp-file "genie-tests-elpa" t))
+         (new (expand-file-name "shadowed-1.0" package-user-dir))
+         (load-path (list old)))
+    (unwind-protect
+        (progn
+          (make-directory new)
+          (dolist (version `((,old . 1) (,new . 2)))
+            (with-temp-file (expand-file-name "genie-tests-shadowed.el" (car version))
+              (insert (format "(defun genie-tests-shadowed () %d)\n\
+(provide 'genie-tests-shadowed)\n" (cdr version)))))
+          (require 'genie-tests-shadowed)
+          (push new load-path)
+          (genie-packages-reload-shadowed)
+          (should (= (genie-tests-shadowed) 2)))
+      (setq features (delq 'genie-tests-shadowed features))
+      (fmakunbound 'genie-tests-shadowed)
+      (delete-directory old t)
+      (delete-directory package-user-dir t))))
+
+(ert-deftest genie-a-wish-can-be-made-in-a-configuration-that-was-copied ()
+  "A tracked file with a new date and the same text does not stop the snapshot."
+  (genie-tests--with-repo
+    (genie-tests--write "init.el" ";; nothing yet\n")
+    (genie--git "add" "init.el")
+    (genie--git "commit" "-qm" "a configuration")
+    (set-file-times (expand-file-name "init.el" (genie--root)) (time-add nil 3600))
+    (genie--snapshot)
+    (should (equal genie--pre "HEAD"))))
+
+(ert-deftest genie-validation-refuses-a-package-that-was-not-installed ()
+  "`use-package' only warns when an install fails; the start is not clean."
+  (should (equal (genie-validate--refusal
+                  "Loading init.el...\nError (use-package): Failed to install \
+doom-themes: Package ‘doom-themes’ is unavailable\n")
+                 "Failed to install doom-themes: Package ‘doom-themes’ is unavailable"))
+  (should-not (genie-validate--refusal "Loading init.el...\nPackage refresh done")))
 
 (ert-deftest genie-validation-refuses-a-wish-with-no-way-back ()
   "The refusal reaches the agent as a verdict, before anything is loaded."

@@ -40,7 +40,13 @@ cat > "$EMACS_D/init.el" <<'EOF'
 ;;; Code:
 
 (require 'package)
+;; Most of what one wishes for lives on MELPA.
+(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
 (unless (bound-and-true-p package--initialized) (package-initialize))
+
+;; What Emacs writes for itself goes in a file of its own, not in this one.
+(setq custom-file (locate-user-emacs-file "custom.el"))
+(load custom-file t t)
 
 ;; The genie itself, straight from the repository (Emacs 29+).
 (unless (package-installed-p 'genie)
@@ -89,6 +95,8 @@ cat > "$EMACS_D/.gitignore" <<'EOF'
 *.elc
 *~
 \#*#
+# Written by Custom, which this lamp keeps out of init.el.
+/custom.el
 EOF
 
 # Wishes are commits: the config root must be a git repository.

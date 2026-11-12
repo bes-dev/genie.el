@@ -4,7 +4,7 @@
 
 ;; Author: Sergei Belousov <sergei.o.belousov@gmail.com>
 ;; Maintainer: Sergei Belousov <sergei.o.belousov@gmail.com>
-;; Version: 0.17.0
+;; Version: 0.18.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: tools, convenience
 ;; URL: https://github.com/bes-dev/genie.el
@@ -135,11 +135,16 @@ a chat is what was said.")
   "Ids of the agents this conversation started that are still working.")
 (defvar-local genie-chat--pen nil
   "Marker where the answer being written is not dressed yet, or nil.")
+(defvar-local genie-chat--answer nil
+  "Marker where what the agent is saying now began, or nil.")
+(defvar-local genie-chat--reply nil
+  "What the agent said last in the turn that is over, or nil.")
 (defvar-local genie-chat--fence nil
   "Non-nil while the answer being written is inside a fenced block.")
 (defvar-local genie-chat--tail nil "Marker where the transcript grows.")
 (defvar-local genie-chat--input nil "Marker where the typed message begins.")
-(defvar-local genie-chat--calls nil "Tool call id → marker at its line.")
+(defvar-local genie-chat--calls nil
+  "Tool call id → (MARKER . CALL): its line here, and the call as it began.")
 (defvar-local genie-chat--touched nil
   "Files the agent's editing tools said they wrote in the turn in flight.")
 (defvar-local genie-chat--commands nil "Skills: (NAME . DESCRIPTION).")
@@ -152,6 +157,11 @@ a chat is what was said.")
 (defvar-local genie-chat--start nil
   "Function called with what was asked before a turn is sent.
 It may signal an error to refuse the turn.")
+(defvar genie-chat-activity-function #'ignore
+  "Called with a chat and what its agent is doing, to be shown elsewhere.
+That is a short line — \"thinking\", or a tool call as the transcript
+has it — or nil when the turn is over.")
+
 (defvar-local genie-chat--finish nil
   "Function called with why it stopped when a turn ends.")
 
@@ -178,6 +188,11 @@ It may signal an error to refuse the turn.")
     map)
   "Keymap for `genie-chat-mode'.")
 
+(defun genie-chat--no-line-numbers ()
+  "Switch line numbers off again in this chat."
+  (when (bound-and-true-p display-line-numbers-mode)
+    (display-line-numbers-mode -1)))
+
 (define-derived-mode genie-chat-mode fundamental-mode "genie"
   "A conversation with the elmee agent.
 \\<genie-chat-mode-map>\\[genie-chat-send] sends what is typed after the \
@@ -191,6 +206,9 @@ conversation elmee keeps, and `genie-sessions' returns to it."
   (setq-local genie-markdown-page-function #'genie-chat--open-page
               line-spacing 0.15)
   (setq-local header-line-format '(:eval (genie-chat--header)))
+  ;; A conversation is not a file: a wish for line numbers everywhere is
+  ;; the first one most people make, and it numbered what the genie said.
+  (add-hook 'display-line-numbers-mode-hook #'genie-chat--no-line-numbers nil t)
   (add-hook 'completion-at-point-functions #'genie-chat--complete-skill nil t)
   (add-hook 'kill-buffer-hook #'genie-chat--shutdown nil t))
 
@@ -480,7 +498,8 @@ read while it is still arriving."
     (when (and leading (not (string-empty-p (string-trim delta))))
       (genie-chat--fresh-line)
       (genie-chat--blank-line)
-      (setq genie-chat--pen (copy-marker genie-chat--tail)))
+      (setq genie-chat--pen (copy-marker genie-chat--tail)
+            genie-chat--answer (copy-marker genie-chat--tail)))
     (genie-chat--insert (if leading (string-trim-left delta) delta))
     (genie-chat--dress)))
 
@@ -497,10 +516,11 @@ read while it is still arriving."
     (dolist (location (append (plist-get call :locations) nil))
       (cl-pushnew (plist-get location :path) genie-chat--touched :test #'equal)))
   (genie-chat--fresh-line)
-  (puthash (plist-get call :toolCallId) (copy-marker genie-chat--tail)
+  (puthash (plist-get call :toolCallId) (cons (copy-marker genie-chat--tail) call)
            genie-chat--calls)
-  (genie-chat--insert (format "◦ %s\n" (genie-chat--call-title call))
-                      'genie-chat-tool))
+  (let ((title (genie-chat--call-title call)))
+    (funcall genie-chat-activity-function (current-buffer) title)
+    (genie-chat--insert (format "◦ %s\n" title) 'genie-chat-tool)))
 
 (defun genie-chat-touched (buffer)
   "Return the files the agent's editing tools wrote in the last turn of BUFFER.
@@ -521,9 +541,11 @@ typed, a file by its name here, a question to this Emacs as one."
                  (plist-get call :locations) ", "))
          (line (lambda (text)
                  (truncate-string-to-width
-                  (car (split-string (format "%s" (or text "")) "\n"))
+                  (or (car (split-string (format "%s" (or text "")) "\n" t "[ \t]+"))
+                      "")
                   72 nil nil "…"))))
     (cond
+     ((plist-get input :what) (format "λ %s" (funcall line (plist-get input :what))))
      ((string-match "\\`mcp__emacs__\\([^ ]*\\)" title)
       (format "λ %s %s" (match-string 1 title) (funcall line (cadr input))))
      ((plist-get input :command)
@@ -538,9 +560,11 @@ typed, a file by its name here, a question to this Emacs as one."
 A call that failed says why under its own line: what went wrong is the
 part of a tool's output worth reading without being asked."
   (when-let* ((id (plist-get call :toolCallId))
-              (at (gethash id genie-chat--calls)))
+              (begun (gethash id genie-chat--calls))
+              (at (car begun)))
     (let ((failed (equal (plist-get call :status) "failed"))
           (inhibit-read-only t))
+      (unless failed (genie-follow (cdr begun)))
       (save-excursion
         (goto-char at)
         (when (looking-at "◦")
@@ -617,7 +641,12 @@ STOP is the agent's stop reason, or `failed' or `exited'."
   (when genie-chat--busy
     (let ((took (floor (float-time (time-since genie-chat--busy)))))
       (setq genie-chat--busy nil genie-chat--thinking nil
-            genie-chat--compacting nil)
+            genie-chat--compacting nil
+            genie-chat--reply (and genie-chat--answer
+                                   (string-trim (buffer-substring
+                                                 genie-chat--answer
+                                                 genie-chat--tail))))
+      (funcall genie-chat-activity-function (current-buffer) nil)
       (genie-chat--stop-clock)
       (genie-chat--fresh-line)
       (when (> took 4)                  ; a quick answer needs no stopwatch
@@ -629,10 +658,27 @@ STOP is the agent's stop reason, or `failed' or `exited'."
     (force-mode-line-update)
     (if genie-chat--finish
         (funcall genie-chat--finish stop)
-      ;; Someone who went elsewhere while it worked is told it is done.
-      (unless (eq (window-buffer) (current-buffer))
-        (message "🧞 %s: %s" (buffer-name)
-                 (if (equal stop "end_turn") "answered" "stopped"))))))
+      ;; Someone who went elsewhere while it worked is told what came of it.
+      (if (equal stop "end_turn")
+          (genie-chat-say (current-buffer))
+        (message "🧞 %s: stopped" (buffer-name))))))
+
+(defun genie-chat-say (buffer)
+  "Say in the echo area what the agent of BUFFER said last.
+For someone who is not looking at that chat.  A few lines are said
+whole; of more, the first line and where the rest is — a window nobody
+asked for is never opened."
+  (let* ((reply (buffer-local-value 'genie-chat--reply buffer))
+         (lines (and reply (split-string reply "\n" t))))
+    (cond ((get-buffer-window buffer))
+          ((null lines) (message "🧞 done"))
+          ((and (<= (length lines) 3)
+                (<= (string-width reply) (* 3 (frame-width))))
+           (message "🧞 %s" reply))
+          (t (message "🧞 %s\n   … the rest is in %s"
+                      (truncate-string-to-width (car lines) (- (frame-width) 6)
+                                                nil nil "…")
+                      (buffer-name buffer))))))
 
 ;;;; Pages an answer links to
 
@@ -673,7 +719,9 @@ Whatever was attached with `genie-ask' goes with it."
       (setq genie-chat--busy (current-time) genie-chat--thinking nil
             genie-chat--recall nil
             genie-chat--pen nil genie-chat--fence nil
+            genie-chat--answer nil genie-chat--reply nil
             genie-chat--attached nil genie-chat--touched nil)
+      (funcall genie-chat-activity-function (current-buffer) "thinking")
       (genie-chat--start-clock)
       (force-mode-line-update)
       ;; A process that cannot even start — elmee not on the path — fails
